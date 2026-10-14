@@ -14,6 +14,22 @@ from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
 
+def _extract_reasoning_effort(req: dict):
+    """Extract reasoning_effort / thinkingLevel from OpenAI or Gemini request payload."""
+    if not isinstance(req, dict):
+        return None
+    effort = req.get("reasoning_effort")
+    if not effort and isinstance(req.get("reasoning"), dict):
+        effort = req["reasoning"].get("effort")
+    if not effort and isinstance(req.get("thinkingConfig"), dict):
+        effort = req["thinkingConfig"].get("thinkingLevel")
+    if not effort and isinstance(req.get("generationConfig"), dict):
+        gen_cfg = req["generationConfig"]
+        if isinstance(gen_cfg.get("thinkingConfig"), dict):
+            effort = gen_cfg["thinkingConfig"].get("thinkingLevel")
+    return effort
+
+
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
@@ -179,7 +195,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -269,7 +287,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -494,7 +514,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
+            model_name,
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
