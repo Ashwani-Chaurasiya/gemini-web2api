@@ -78,22 +78,33 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
+| `gemini-4-argon` | Gemini 4 Argon (Pro/Ultra 网页端路由，默认中等思考) | ~2万字 |
+| `gemini-4-argon-low` / `-medium` / `-high` | Gemini 4 Argon 低 / 中 / 高思考强度 | ~2万字 |
+| `gemini-3.8-flash` | 全能模型 (最新 Gemini 3.8 Flash) | ~1.2万字 |
+| `gemini-3.8-flash-thinking` | Gemini 3.8 Flash 扩展深度思考 | **~2万字** |
+| `gemini-3.8-flash-thinking-lite` | Gemini 3.8 Flash 自适应思考深度 | ~1.5万字 |
+| `gemini-3.7-flash` | 全能模型 (Gemini 3.7 Flash) | ~1.2万字 |
+| `gemini-3.6-flash` | 全能模型 (Gemini 3.6 Flash) | ~1.2万字 |
 | `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
 | `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
 | `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
+| `gemini-3.1-pro-low` / `-medium` / `-high` | Gemini 3.1 Pro 低 / 中 / 高思考强度 | ~1.2万–2万字 |
 | `gemini-auto` | 自动选择模型 | 不定 |
 | `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
 
 ### 思考深度
 
-在模型名后追加 `@think=N`:
+支持三种方式调节思考深度 (`low` / `medium` / `high`):
+
+1. **OpenAI `reasoning_effort` 参数** (`"low"`, `"medium"`, `"high"`)
+2. **模型名后缀** (`gemini-4-argon-low`, `gemini-4-argon-medium`, `gemini-4-argon-high`)
+3. **在模型名后追加 `@think=N`**:
 
 ```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
+gemini-4-argon@think=0              # 最深 / high
+gemini-4-argon@think=2              # 中等 / medium
+gemini-4-argon@think=4              # 最浅 / low
 ```
 
 ## 可选: Cookie 配置 (Pro 模型)

@@ -439,40 +439,140 @@ function getRandomSecChUaPlatform() {
 //   0 = 启用深度思考（模型会花更多时间推理）
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
+var REASONING_EFFORT_MAP = {
+  minimal: { think: 4, variant: 1 },
+  low: { think: 4, variant: 1 },
+  medium: { think: 2, variant: 2 },
+  high: { think: 0, variant: 3 },
+  xhigh: { think: 0, variant: 3 },
+  max: { think: 0, variant: 3 },
+};
+
 var MODELS = {
+  'gemini-4-argon': {
+    mode: 3,
+    think: 2,
+    variant: 2,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Gemini 4 Argon (Pro/Ultra web routing, medium thinking default)',
+  },
+  'gemini-4-argon-low': {
+    mode: 3,
+    think: 4,
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Gemini 4 Argon (low thinking effort)',
+  },
+  'gemini-4-argon-medium': {
+    mode: 3,
+    think: 2,
+    variant: 2,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Gemini 4 Argon (medium thinking effort)',
+  },
+  'gemini-4-argon-high': {
+    mode: 3,
+    think: 0,
+    variant: 3,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Gemini 4 Argon (high / deepest thinking effort)',
+  },
+  'gemini-3.8-flash': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Latest all-around model (Gemini 3.8 Flash)',
+  },
+  'gemini-3.8-flash-thinking': {
+    mode: 2,
+    think: 0,
+    variant: 1,
+    ticket: 'e051ce1aa80aa576',
+    desc: 'Gemini 3.8 Flash with deep thinking (~20k chars)',
+  },
+  'gemini-3.8-flash-thinking-lite': {
+    mode: 5,
+    think: 0,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 3.8 Flash with adaptive thinking depth',
+  },
+  'gemini-3.7-flash': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'All-around model (Gemini 3.7 Flash)',
+  },
   'gemini-3.6-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
-    desc: 'Latest all-around model (Gemini 3.6 Flash)',
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'All-around model (Gemini 3.6 Flash)',
   },
   'gemini-3.5-flash': {
     mode: 1,        // FAST
     think: 4,       // AUTO
+    variant: 1,
+    ticket: '56fdd199312815e2',
     desc: 'Alias for gemini-3.6-flash (backend upgraded)',
   },
   'gemini-3.5-flash-thinking': {
     mode: 2,        // THINKING - 深度思考模式
     think: 0,       // 启用深度思考
+    variant: 1,
+    ticket: 'e051ce1aa80aa576',
     desc: 'Deep thinking mode, longest output (~20k chars)',
   },
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
     think: 4,       // AUTO
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
     desc: 'Pro model (requires cookie for real routing)',
+  },
+  'gemini-3.1-pro-low': {
+    mode: 3,
+    think: 4,
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Pro model (low thinking effort)',
+  },
+  'gemini-3.1-pro-medium': {
+    mode: 3,
+    think: 2,
+    variant: 2,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Pro model (medium thinking effort)',
+  },
+  'gemini-3.1-pro-high': {
+    mode: 3,
+    think: 0,
+    variant: 3,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Pro model (high thinking effort)',
   },
   'gemini-auto': {
     mode: 4,        // AUTO - 自动模型选择
     think: 4,       // AUTO
+    variant: 1,
+    ticket: '56fdd199312815e2',
     desc: 'Auto model selection',
   },
   'gemini-3.5-flash-thinking-lite': {
     mode: 5,        // FAST_DYNAMIC_THINKING - 动态思考
     think: 0,       // 启用思考
+    variant: 1,
+    ticket: '56fdd199312815e2',
     desc: 'Dynamic thinking with adaptive depth',
   },
   'gemini-flash-lite': {
     mode: 6,        // FLASH_LITE - 轻量快速
     think: 4,       // AUTO
+    variant: 0,
+    ticket: '56fdd199312815e2',
     desc: 'Lightweight fast model',
   },
 };
@@ -898,10 +998,20 @@ function getAccountPrefix(config) {
  * @param {Object} config - 请求级配置对象
  * @returns {string} URL 编码的请求体字符串，格式为 "f.req=..."
  */
-function buildPayload(prompt, modelId, thinkMode, config) {
-  // 创建 80 个元素的数组，所有元素初始化为 null
-  // 这是 Gemini Web 前端实际使用的数据结构
-  var inner = new Array(80).fill(null);
+function buildModelTicket(cfg) {
+  if (!cfg || !cfg.ticket) return null;
+  var variant = cfg.variant !== undefined ? cfg.variant : 1;
+  var arr = [
+    1, null, null, null, cfg.ticket, null, null, 0,
+    [4, 5, 6, 8, 4, 5, 6, 8],
+    null, null, 2, null, null,
+    cfg.mode, variant, generateUUID(),
+  ];
+  return JSON.stringify(arr);
+}
+
+function buildPayload(prompt, modelId, thinkMode, config, variant) {
+  var inner = new Array(102).fill(null);
 
   // --- 用户消息 ---
   // [prompt, 消息索引, 图片, 附件, 元数据, 上下文ID, 新对话标志]
@@ -954,10 +1064,10 @@ function buildPayload(prompt, modelId, thinkMode, config) {
   inner[68] = 1;   // 未知标志
 
   // ⭐ 模型选择（最关键字段）
-  // MODE_CATEGORY 枚举值:
-  //   1=FAST（快速）, 2=THINKING（深度思考）, 3=PRO（专业版）
-  //   4=AUTO（自动）, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
   inner[79] = modelId;
+  if (variant !== undefined && variant !== null) {
+    inner[80] = variant;
+  }
 
   // --- 外层包装 ---
   // Gemini 的请求体是双层嵌套 JSON:
@@ -1854,8 +1964,9 @@ function sendSSE(stream) {
  *   - thinkMode: 思考模式（0=深度思考, 4=自动）
  *   - error: 错误信息，null 表示正常
  */
-function resolveModel(modelName) {
+function resolveModel(modelName, reasoningEffort) {
   var thinkOverride = null;
+  var variantOverride = null;
   var actualModelName = modelName;
 
   // 检查是否包含 @think= 参数
@@ -1868,17 +1979,36 @@ function resolveModel(modelName) {
     }
   }
 
+  if (reasoningEffort) {
+    var effortKey = String(reasoningEffort).trim().toLowerCase();
+    if (REASONING_EFFORT_MAP[effortKey]) {
+      if (thinkOverride === null) {
+        thinkOverride = REASONING_EFFORT_MAP[effortKey].think;
+      }
+      variantOverride = REASONING_EFFORT_MAP[effortKey].variant;
+    }
+  }
+
   // 查找模型配置
   var cfg = MODELS[actualModelName];
   if (!cfg) {
     return { error: '未知模型: ' + actualModelName };
   }
 
+  var effectiveVariant = variantOverride !== null ? variantOverride : cfg.variant;
+  var ticketCfg = {
+    mode: cfg.mode,
+    variant: effectiveVariant,
+    ticket: cfg.ticket,
+  };
+
   // 返回解析结果
   return {
     modelName: actualModelName,
     modelId: cfg.mode,                                            // 模型类别 ID
     thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,  // 使用覆盖值或默认值
+    variant: effectiveVariant,
+    ticket: buildModelTicket(ticketCfg),
     error: null,
   };
 }

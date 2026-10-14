@@ -88,18 +88,33 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
-| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
-| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+| `gemini-4-argon` | Gemini 4 Argon (Pro/Ultra web routing, medium thinking default) | ~20K chars |
+| `gemini-4-argon-low` / `-medium` / `-high` | Gemini 4 Argon with explicit low / medium / high thinking effort | ~20K chars |
+| `gemini-3.8-flash` | Latest all-around model | ~12K chars |
+| `gemini-3.8-flash-thinking` | Gemini 3.8 Flash with deep thinking | **~20K chars** |
+| `gemini-3.8-flash-thinking-lite` | Gemini 3.8 Flash with adaptive thinking depth | ~15K chars |
+| `gemini-3.7-flash` | All-around model (Gemini 3.7 Flash) | ~12K chars |
+| `gemini-3.6-flash` | All-around model (Gemini 3.6 Flash) | ~12K chars |
+| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12K chars |
+| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20K chars** |
+| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15K chars |
+| `gemini-3.1-pro` | Advanced math & code (requires cookie) | ~12K chars |
+| `gemini-3.1-pro-low` / `-medium` / `-high` | Gemini 3.1 Pro with explicit thinking effort | ~12K–20K chars |
+| `gemini-auto` | Auto model selection | Varies |
+| `gemini-flash-lite` | Fastest, lightweight | ~10K chars |
 
-### Thinking Depth
+### Thinking Depth Control
 
-Append `@think=N` to any model name:
+You can control thinking depth in three ways:
 
+1. **OpenAI `reasoning_effort` parameter** (`"low"`, `"medium"`, `"high"` in `/v1/chat/completions` or `/v1/responses`)
+2. **Model suffix** (`gemini-4-argon-low`, `gemini-4-argon-medium`, `gemini-4-argon-high`)
+3. **`@think=N` suffix**:
+
+```
+gemini-4-argon@think=0              # deepest / high thinking
+gemini-4-argon@think=2              # medium thinking
+gemini-4-argon@think=4              # minimal / low thinking
 ```
 gemini-3.5-flash-thinking@think=0   # deepest (default)
 gemini-3.5-flash-thinking@think=2   # medium

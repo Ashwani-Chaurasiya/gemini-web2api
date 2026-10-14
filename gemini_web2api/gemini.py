@@ -20,6 +20,33 @@ from .config import CONFIG
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+_HEX_TICKET_ENTRY_RE = re.compile(
+    r'\[\s*\\?"([0-9a-f]{16})\\?"\s*,\s*\\?"([^"\\]{1,80})\\?"',
+    re.IGNORECASE,
+)
+
+
+def discover_model_tickets_from_html(html: str) -> dict:
+    """Scan Gemini web page HTML / WIZ_global_data for 16-hex model tickets."""
+    discovered = {}
+    if not html:
+        return discovered
+    for hex_id, label in _HEX_TICKET_ENTRY_RE.findall(html):
+        hex_lower = hex_id.lower()
+        name_lower = label.strip().lower()
+        if "argon" in name_lower or "ultra" in name_lower:
+            discovered.setdefault("argon", hex_lower)
+            discovered.setdefault("gemini-4-argon", hex_lower)
+        elif "pro" in name_lower:
+            discovered.setdefault("pro", hex_lower)
+            discovered.setdefault("gemini-3.1-pro", hex_lower)
+        elif "thinking" in name_lower or "reasoning" in name_lower:
+            discovered.setdefault("thinking", hex_lower)
+        elif "lite" in name_lower:
+            discovered.setdefault("flash_lite", hex_lower)
+        elif "flash" in name_lower or "fast" in name_lower:
+            discovered.setdefault("flash", hex_lower)
+    return discovered
 
 
 def log(msg: str):
@@ -60,10 +87,23 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            if data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data["xsrf_token"]
+            if data.get("gemini_bl"):
+                CONFIG["gemini_bl"] = data["gemini_bl"]
+            if data.get("auth_user") is not None:
+                CONFIG["auth_user"] = str(data["auth_user"])
+            if isinstance(data.get("model_tickets"), dict):
+                tickets = dict(CONFIG.get("model_tickets") or {})
+                tickets.update(data["model_tickets"])
+                CONFIG["model_tickets"] = tickets
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
+        if not sapisid and cookie_str:
+            m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
+            sapisid = m.group(1) if m else ""
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
@@ -85,7 +125,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(extra_fields: dict = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -96,6 +136,8 @@ def _build_headers() -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+    if extra_fields and "_ticket" in extra_fields:
+        headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -139,7 +181,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[79] = model_id
     if extra_fields:
         for k, v in extra_fields.items():
-            inner[k] = v
+            if isinstance(k, int):
+                inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -206,7 +249,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(extra_fields)
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
@@ -242,7 +285,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(extra_fields)
     client = _get_httpx_client()
 
     last_err = None

@@ -6,10 +6,20 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs
 
+import importlib.util
+from pathlib import Path
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
+from gemini_web2api.gemini import _build_headers, _build_payload, discover_model_tickets_from_html
+from gemini_web2api.models import MODELS, build_model_ticket, resolve_model
 from gemini_web2api.server import GeminiHandler, ThreadedServer
-from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
+
+_SINGLE_SPEC = importlib.util.spec_from_file_location(
+    "gemini_web2api_single",
+    Path(__file__).resolve().parent.parent / "gemini_web2api.py",
+)
+single_file = importlib.util.module_from_spec(_SINGLE_SPEC)
+_SINGLE_SPEC.loader.exec_module(single_file)
 
 
 def _decode_payload(payload):
@@ -439,6 +449,99 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
+
+    @mock.patch("gemini_web2api.server.generate", return_value='```tool_call\n{"name": "read_file", "arguments": {"path": "a.py"}}\n```')
+    def test_chat_stream_tool_calls_include_index_and_argon_reasoning_effort(self, generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-4-argon",
+                "reasoning_effort": "high",
+                "messages": [{"role": "user", "content": "read a.py"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read file",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_args.args[1], 3)
+        self.assertEqual(generate.call_args.args[2], 0)
+        self.assertEqual(generate.call_args.args[4][80], 3)
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        tool_call_delta = chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(tool_call_delta["index"], 0)
+        self.assertEqual(tool_call_delta["function"]["name"], "read_file")
+
+
+class ArgonAndModelRoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_modular_and_single_file_models_in_sync(self):
+        self.assertEqual(set(MODELS.keys()), set(single_file.MODELS.keys()))
+        for name in MODELS:
+            self.assertEqual(MODELS[name]["mode"], single_file.MODELS[name]["mode"])
+            self.assertEqual(MODELS[name]["think"], single_file.MODELS[name]["think"])
+            self.assertEqual(MODELS[name].get("variant"), single_file.MODELS[name].get("variant"))
+
+    def test_argon_thinking_variants_and_reasoning_effort(self):
+        name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="low")
+        self.assertIsNone(err)
+        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 4, 1))
+
+        name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="medium")
+        self.assertIsNone(err)
+        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 2, 2))
+
+        name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="high")
+        self.assertIsNone(err)
+        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 0, 3))
+
+        ticket = json.loads(extra["_ticket"])
+        self.assertEqual(len(ticket), 17)
+        self.assertEqual(ticket[14], 3)
+        self.assertEqual(ticket[15], 3)
+        headers = _build_headers(extra)
+        self.assertIn("X-Goog-Ext-525001261-Jspb", headers)
+
+        inner = _decode_payload(_build_payload("hi", mode, think, None, extra))
+        self.assertEqual(inner[79], 3)
+        self.assertEqual(inner[80], 3)
+        self.assertEqual(inner[17], [[0]])
+
+    def test_dynamic_ticket_discovery_and_override(self):
+        sample_html = '[["aa11bb22cc33dd44","Gemini 4 Argon"],["56fdd199312815e2","Gemini 3.8 Flash"]]'
+        discovered = discover_model_tickets_from_html(sample_html)
+        self.assertEqual(discovered.get("argon"), "aa11bb22cc33dd44")
+        self.assertEqual(discovered.get("gemini-4-argon"), "aa11bb22cc33dd44")
+
+        _, _, _, _, extra = resolve_model("gemini-4-argon", model_tickets=discovered)
+        ticket = json.loads(extra["_ticket"])
+        self.assertEqual(ticket[4], "aa11bb22cc33dd44")
+
+    def test_parse_tool_calls_supports_multiple_formats(self):
+        clean, calls = parse_tool_calls('Hello\n```json\n{"name": "bash", "args": {"command": "ls"}}\n```')
+        self.assertEqual(clean, "Hello")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "bash")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": "ls"})
 
 
 if __name__ == "__main__":

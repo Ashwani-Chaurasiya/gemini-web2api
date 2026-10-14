@@ -227,6 +227,31 @@ async function readGeminiPageMetadata(tabs) {
         const xsrfToken = wiz.SNlM0e || regexValue("SNlM0e");
         const geminiBl = wiz.cfb2h || resourceBl || regexValue("cfb2h");
 
+        const modelTickets = {};
+        try {
+          const ticketRe = /\[\s*\\?"([0-9a-f]{16})\\?"\s*,\s*\\?"([^"\\]{1,80})\\?"/gi;
+          let m;
+          while ((m = ticketRe.exec(html)) !== null) {
+            const hexId = m[1].toLowerCase();
+            const label = m[2].trim().toLowerCase();
+            if (label.includes("argon") || label.includes("ultra")) {
+              if (!modelTickets.argon) modelTickets.argon = hexId;
+              if (!modelTickets["gemini-4-argon"]) modelTickets["gemini-4-argon"] = hexId;
+            } else if (label.includes("pro")) {
+              if (!modelTickets.pro) modelTickets.pro = hexId;
+              if (!modelTickets["gemini-3.1-pro"]) modelTickets["gemini-3.1-pro"] = hexId;
+            } else if (label.includes("thinking") || label.includes("reasoning")) {
+              if (!modelTickets.thinking) modelTickets.thinking = hexId;
+            } else if (label.includes("lite")) {
+              if (!modelTickets.flash_lite) modelTickets.flash_lite = hexId;
+            } else if (label.includes("flash") || label.includes("fast")) {
+              if (!modelTickets.flash) modelTickets.flash = hexId;
+            }
+          }
+        } catch {
+          // Ignore model ticket regex scan errors.
+        }
+
         let source = null;
         if (wiz.SNlM0e || wiz.cfb2h) source = "WIZ_global_data";
         else if (resourceBl) source = "performance";
@@ -235,6 +260,7 @@ async function readGeminiPageMetadata(tabs) {
         return {
           xsrfToken: xsrfToken || null,
           geminiBl: geminiBl || null,
+          modelTickets,
           source,
           url: location.href
         };
@@ -385,7 +411,8 @@ exportButton.addEventListener("click", async () => {
       sapisid: info.selected.get("SAPISID").value,
       auth_user: info.authUser,
       xsrf_token: info.pageMetadata.xsrfToken,
-      gemini_bl: info.pageMetadata.geminiBl
+      gemini_bl: info.pageMetadata.geminiBl,
+      model_tickets: info.pageMetadata.modelTickets || {}
     };
 
     await downloadJson("gemini-auth.json", payload);

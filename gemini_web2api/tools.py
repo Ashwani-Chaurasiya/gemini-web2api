@@ -169,29 +169,83 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+    """Extract tool_call blocks across all common fence formats. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    clean_parts = []
-    last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
-        clean_parts.append(text[last_end:m.start()])
-        last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
+
+    def _add_call(data):
+        if isinstance(data, dict) and "name" in data:
+            args = data.get("arguments", data.get("args", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
                     "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
+                    "arguments": json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args,
                 },
             })
+            return True
+        return False
+
+    pattern1 = re.compile(r'```tool_call\s*\n(.*?)\n```', re.DOTALL)
+    for m in pattern1.finditer(text):
+        try:
+            _add_call(json.loads(m.group(1).strip()))
         except (json.JSONDecodeError, KeyError):
             pass
-    clean_parts.append(text[last_end:])
-    clean = "".join(clean_parts).strip()
-    return clean, tool_calls
+    if tool_calls:
+        return pattern1.sub('', text).strip(), tool_calls
+
+    pattern2 = re.compile(r'```(?:function_call|tool_calls?)\s*\n(.*?)\n```', re.DOTALL)
+    for m in pattern2.finditer(text):
+        try:
+            _add_call(json.loads(m.group(1).strip()))
+        except (json.JSONDecodeError, KeyError):
+            pass
+    if tool_calls:
+        return pattern2.sub('', text).strip(), tool_calls
+
+    pattern3 = re.compile(r'```json\s*\n(\s*\{.*?\}\s*)\n```', re.DOTALL)
+    matched_spans = []
+    for m in pattern3.finditer(text):
+        try:
+            data = json.loads(m.group(1).strip())
+            if "name" in data and ("arguments" in data or "args" in data):
+                if _add_call(data):
+                    matched_spans.append(m.span())
+        except (json.JSONDecodeError, KeyError):
+            pass
+    if tool_calls:
+        clean = text
+        for start, end in reversed(matched_spans):
+            clean = clean[:start] + clean[end:]
+        return clean.strip(), tool_calls
+
+    pattern4 = re.compile(r'\[(?:tool_call|function_call):\s*(\w+)\((\{.*?\})\)\s*\]', re.DOTALL)
+    for m in pattern4.finditer(text):
+        try:
+            args = json.loads(m.group(2))
+            _add_call({"name": m.group(1), "arguments": args})
+        except (json.JSONDecodeError, KeyError):
+            pass
+    if tool_calls:
+        return pattern4.sub('', text).strip(), tool_calls
+
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+            if "name" in data and ("arguments" in data or "args" in data):
+                if _add_call(data):
+                    return "", tool_calls
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return text, []
 
 
 # ─── Google Native API helpers ─────────────────────────────────────────────────
