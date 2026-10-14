@@ -5,9 +5,11 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
+import threading
 
 try:
     import httpx
@@ -19,34 +21,19 @@ from .config import CONFIG
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_lock = threading.Lock()
+_refresh_lock = threading.Lock()
 _httpx_client = None
+
 _HEX_TICKET_ENTRY_RE = re.compile(
-    r'\[\s*\\?"([0-9a-f]{16})\\?"\s*,\s*\\?"([^"\\]{1,80})\\?"',
+    r'\[\s*(?:null\s*,\s*)?\\?"([0-9a-f]{16})\\?"\s*,\s*(?:null\s*,\s*)?\\?"([^"\\]{2,80})\\?"',
     re.IGNORECASE,
 )
-
-
-def discover_model_tickets_from_html(html: str) -> dict:
-    """Scan Gemini web page HTML / WIZ_global_data for 16-hex model tickets."""
-    discovered = {}
-    if not html:
-        return discovered
-    for hex_id, label in _HEX_TICKET_ENTRY_RE.findall(html):
-        hex_lower = hex_id.lower()
-        name_lower = label.strip().lower()
-        if "argon" in name_lower or "ultra" in name_lower:
-            discovered.setdefault("argon", hex_lower)
-            discovered.setdefault("gemini-4-argon", hex_lower)
-        elif "pro" in name_lower:
-            discovered.setdefault("pro", hex_lower)
-            discovered.setdefault("gemini-3.1-pro", hex_lower)
-        elif "thinking" in name_lower or "reasoning" in name_lower:
-            discovered.setdefault("thinking", hex_lower)
-        elif "lite" in name_lower:
-            discovered.setdefault("flash_lite", hex_lower)
-        elif "flash" in name_lower or "fast" in name_lower:
-            discovered.setdefault("flash", hex_lower)
-    return discovered
+_MODEL_NAME_TOKEN_RE = re.compile(
+    r'^(?:gemini[\s\-_]*(?:\d+(?:\.\d+)?[\s\-_]*)?)?'
+    r'(argon|ultra|pro|thinking|reasoning|flash[\s\-_]*lite|flash|fast)\b',
+    re.IGNORECASE,
+)
 
 
 def log(msg: str):
@@ -72,43 +59,135 @@ def _get_httpx_client():
     return _httpx_client
 
 
+def _classify_model_ticket_label(label: str):
+    """Classify a display name from WIZ_global_data into a model ticket bucket."""
+    if not isinstance(label, str):
+        return None
+    cleaned = label.strip()
+    if not cleaned:
+        return None
+    lower = cleaned.lower()
+    m = _MODEL_NAME_TOKEN_RE.match(cleaned)
+    if not m and "gemini" in lower:
+        if re.search(r"\b(argon|ultra)\b", lower):
+            return "argon"
+        if re.search(r"\bpro\b", lower):
+            return "pro"
+        if re.search(r"\b(thinking|reasoning)\b", lower):
+            return "thinking"
+        if re.search(r"\blite\b", lower):
+            return "flash_lite"
+        if re.search(r"\b(flash|fast)\b", lower):
+            return "flash"
+        return None
+    if not m:
+        return None
+    token = m.group(1).lower().replace("-", "_").replace(" ", "_")
+    if token in ("argon", "ultra"):
+        return "argon"
+    if token == "pro":
+        return "pro"
+    if token in ("thinking", "reasoning"):
+        return "thinking"
+    if "lite" in token:
+        return "flash_lite"
+    if token in ("flash", "fast"):
+        return "flash"
+    return None
+
+
+def discover_model_tickets_from_html(html: str) -> dict:
+    """Scan Gemini web page HTML / WIZ_global_data for 16-hex model tickets."""
+    discovered = {}
+    if not html:
+        return discovered
+    for hex_id, label in _HEX_TICKET_ENTRY_RE.findall(html):
+        bucket = _classify_model_ticket_label(label)
+        if not bucket:
+            continue
+        hex_lower = hex_id.lower()
+        # Prefer explicit "Gemini ..." labels over generic tier names
+        is_gemini_prefixed = "gemini" in label.lower()
+        if bucket == "argon":
+            if is_gemini_prefixed or "argon" not in discovered:
+                discovered["argon"] = hex_lower
+                discovered["gemini-4-argon"] = hex_lower
+        elif bucket == "pro":
+            if is_gemini_prefixed or "pro" not in discovered:
+                discovered["pro"] = hex_lower
+                discovered["gemini-3.1-pro"] = hex_lower
+        elif bucket == "thinking":
+            if is_gemini_prefixed or "thinking" not in discovered:
+                discovered["thinking"] = hex_lower
+        elif bucket == "flash_lite":
+            if is_gemini_prefixed or "flash_lite" not in discovered:
+                discovered["flash_lite"] = hex_lower
+        elif bucket == "flash":
+            if is_gemini_prefixed or "flash" not in discovered:
+                discovered["flash"] = hex_lower
+    return discovered
+
+
+def _parse_netscape_cookies(raw: str) -> str:
+    """Parse Netscape cookies.txt (including #HttpOnly_ entries) for google.com."""
+    pairs = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain = parts[0].lstrip(".").lower()
+            if domain == "google.com" or domain.endswith(".google.com"):
+                pairs[parts[5]] = parts[6]
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
-    try:
-        mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+    with _cookie_lock:
+        try:
+            mtime = os.path.getmtime(cookie_file)
+            if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+                return _cookie_cache["str"], _cookie_cache["sapisid"]
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                data = json.loads(content)
+                cookie_str = data.get("cookie", "")
+                sapisid = data.get("sapisid", "")
+                if data.get("xsrf_token"):
+                    CONFIG["xsrf_token"] = data["xsrf_token"]
+                if data.get("gemini_bl"):
+                    CONFIG["gemini_bl"] = data["gemini_bl"]
+                if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
+                    CONFIG["auth_user"] = str(data["auth_user"])
+                if isinstance(data.get("model_tickets"), dict):
+                    tickets = dict(CONFIG.get("model_tickets") or {})
+                    tickets.update(data["model_tickets"])
+                    CONFIG["model_tickets"] = tickets
+            elif "\t" in content:
+                cookie_str = _parse_netscape_cookies(content)
+                sapisid = ""
+            else:
+                cookie_str = content
+                pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
+                sapisid = pairs.get("SAPISID", "")
+            if not sapisid and cookie_str:
+                m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
+                sapisid = m.group(1) if m else ""
+            _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+            return cookie_str, sapisid if sapisid else None
+        except Exception as e:
+            log(f"Cookie load error: {e}")
             return _cookie_cache["str"], _cookie_cache["sapisid"]
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-            if data.get("xsrf_token"):
-                CONFIG["xsrf_token"] = data["xsrf_token"]
-            if data.get("gemini_bl"):
-                CONFIG["gemini_bl"] = data["gemini_bl"]
-            if data.get("auth_user") is not None:
-                CONFIG["auth_user"] = str(data["auth_user"])
-            if isinstance(data.get("model_tickets"), dict):
-                tickets = dict(CONFIG.get("model_tickets") or {})
-                tickets.update(data["model_tickets"])
-                CONFIG["model_tickets"] = tickets
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        if not sapisid and cookie_str:
-            m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
-            sapisid = m.group(1) if m else ""
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
-        return cookie_str, sapisid if sapisid else None
-    except Exception as e:
-        log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -126,6 +205,7 @@ def _account_prefix() -> str:
 
 
 def _build_headers(extra_fields: dict = None) -> dict:
+    cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -136,9 +216,8 @@ def _build_headers(extra_fields: dict = None) -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    if extra_fields and "_ticket" in extra_fields:
+    if extra_fields and "_ticket" in extra_fields and CONFIG.get("send_model_ticket", True):
         headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
-    cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -146,10 +225,55 @@ def _build_headers(extra_fields: dict = None) -> dict:
     return headers
 
 
+def refresh_bl_and_xsrf() -> bool:
+    """Refresh gemini_bl, xsrf_token, and model tickets from gemini.google.com."""
+    with _refresh_lock:
+        try:
+            cookie_str, sapisid = load_cookie()
+            account_prefix = _account_prefix()
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            if cookie_str:
+                headers["Cookie"] = cookie_str
+            if sapisid:
+                headers["Authorization"] = make_sapisidhash(sapisid)
+            req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app", headers=headers)
+            ctx = _get_ssl_ctx()
+            proxy = CONFIG.get("proxy")
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                    urllib.request.HTTPSHandler(context=ctx),
+                )
+                resp = opener.open(req, timeout=15)
+            else:
+                resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+            html = resp.read().decode("utf-8", errors="replace")
+            updated = False
+            bl_m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', html) or re.search(
+                r"(boq_assistant-bard-web-server_\d+\.\d+_p\d+)", html
+            )
+            if bl_m:
+                CONFIG["gemini_bl"] = bl_m.group(1)
+                updated = True
+            at_m = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
+            if at_m:
+                CONFIG["xsrf_token"] = at_m.group(1)
+                updated = True
+            discovered = discover_model_tickets_from_html(html)
+            if discovered:
+                tickets = dict(CONFIG.get("model_tickets") or {})
+                tickets.update(discovered)
+                CONFIG["model_tickets"] = tickets
+                updated = True
+            return updated
+        except Exception as e:
+            log(f"BL/XSRF auto-refresh failed: {e}")
+            return False
+
+
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
-        # Match Gemini Web temporary-chat requests.
         inner[41] = [1]
         inner[45] = 1
     else:
@@ -157,6 +281,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    load_cookie()
     inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -191,6 +316,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
 
 
 def _get_url() -> str:
+    load_cookie()
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
     return (
@@ -207,6 +333,27 @@ def clean_text(text: str, strip: bool = True) -> str:
     )
     text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
     return text.strip() if strip else text
+
+
+def extract_served_model_info(raw: str) -> tuple:
+    """Extract (served_hex_id, served_label) from wrb.fr response frames if present."""
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 100:
+            continue
+        try:
+            arr = json.loads(line)
+            inner_str = arr[0][2]
+            if not inner_str:
+                continue
+            inner = json.loads(inner_str)
+            if isinstance(inner, list) and len(inner) > 39:
+                hex_id = inner[39] if isinstance(inner[39], str) else None
+                label = inner[42] if len(inner) > 42 and isinstance(inner[42], str) else None
+                if hex_id or label:
+                    return hex_id, label
+        except (json.JSONDecodeError, IndexError, TypeError):
+            pass
+    return None, None
 
 
 def _extract_texts_from_line(line: str) -> list:
@@ -237,24 +384,32 @@ def extract_response_text(raw: str) -> str:
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    hex_id, label = extract_served_model_info(raw)
+    if hex_id or label:
+        log(f"[model-verify] Served model: {label or 'unknown'} [{hex_id or 'no-hex'}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
-            if len(t) > len(last_text):
-                last_text = t
-    return clean_text(last_text)
+            cleaned = clean_text(t)
+            if cleaned:
+                last_text = cleaned
+    return last_text
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
-    headers = _build_headers(extra_fields)
+    load_cookie()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    refreshed = False
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
+    attempt = 0
+    while attempt < attempts:
+        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+        url = _get_url()
+        headers = _build_headers(extra_fields)
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -267,10 +422,21 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (400, 405) and not refreshed and refresh_bl_and_xsrf():
+                refreshed = True
+                log(f"HTTP {e.code}: refreshed BL/XSRF, retrying immediately...")
+                continue
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
@@ -283,16 +449,25 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers(extra_fields)
+    load_cookie()
     client = _get_httpx_client()
+    refreshed = False
 
     last_err = None
     emitted_raw_text = ""
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
+    attempt = 0
+    while attempt < attempts:
+        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+        url = _get_url()
+        headers = _build_headers(extra_fields)
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                if resp.status_code in (400, 405) and not refreshed and not emitted_raw_text:
+                    refreshed = True
+                    if refresh_bl_and_xsrf():
+                        log(f"Stream HTTP {resp.status_code}: refreshed BL/XSRF, retrying immediately...")
+                        continue
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
@@ -317,7 +492,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            attempt += 1
+            if attempt < attempts:
+                log(f"Stream retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err

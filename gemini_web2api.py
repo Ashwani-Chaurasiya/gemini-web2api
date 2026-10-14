@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "send_model_ticket": True,
     "model_tickets": {},
 }
 
@@ -74,36 +75,44 @@ CONFIG = dict(DEFAULT_CONFIG)
 REASONING_EFFORT_MAP = {
     "minimal": (4, 1),
     "low": (4, 1),
-    "medium": (2, 2),
-    "high": (0, 3),
-    "xhigh": (0, 3),
-    "max": (0, 3),
+    "medium": (2, 4),
+    "high": (0, 2),
+    "xhigh": (0, 2),
+    "max": (0, 2),
+}
+
+THINK_TO_VARIANT = {
+    0: 2,
+    1: 2,
+    2: 4,
+    3: 1,
+    4: 1,
 }
 
 MODELS = {
     "gemini-4-argon": {
-        "mode": 3, "think": 2, "variant": 2,
-        "ticket": "e6fa609c3fa255c0",
+        "mode": 8, "think": 2, "variant": 4,
+        "ticket": "95a4c0abcba24364",
         "ticket_key": "argon",
-        "desc": "Gemini 4 Argon (Pro/Ultra web routing, medium thinking default)",
+        "desc": "Gemini 4 Argon (Ultra web routing, medium thinking default)",
     },
     "gemini-4-argon-low": {
-        "mode": 3, "think": 4, "variant": 1,
-        "ticket": "e6fa609c3fa255c0",
+        "mode": 8, "think": 4, "variant": 1,
+        "ticket": "95a4c0abcba24364",
         "ticket_key": "argon",
         "desc": "Gemini 4 Argon (low thinking effort)",
     },
     "gemini-4-argon-medium": {
-        "mode": 3, "think": 2, "variant": 2,
-        "ticket": "e6fa609c3fa255c0",
+        "mode": 8, "think": 2, "variant": 4,
+        "ticket": "95a4c0abcba24364",
         "ticket_key": "argon",
         "desc": "Gemini 4 Argon (medium thinking effort)",
     },
     "gemini-4-argon-high": {
-        "mode": 3, "think": 0, "variant": 3,
-        "ticket": "e6fa609c3fa255c0",
+        "mode": 8, "think": 0, "variant": 2,
+        "ticket": "95a4c0abcba24364",
         "ticket_key": "argon",
-        "desc": "Gemini 4 Argon (high / deepest thinking effort)",
+        "desc": "Gemini 4 Argon (high / extended thinking effort)",
     },
     "gemini-3.8-flash": {
         "mode": 1, "think": 4, "variant": 1,
@@ -112,7 +121,7 @@ MODELS = {
         "desc": "Latest all-around model (Gemini 3.8 Flash)",
     },
     "gemini-3.8-flash-thinking": {
-        "mode": 2, "think": 0, "variant": 1,
+        "mode": 2, "think": 0, "variant": 2,
         "ticket": "e051ce1aa80aa576",
         "ticket_key": "thinking",
         "desc": "Gemini 3.8 Flash with deep thinking (~20k chars)",
@@ -160,13 +169,13 @@ MODELS = {
         "desc": "Pro model (low thinking effort)",
     },
     "gemini-3.1-pro-medium": {
-        "mode": 3, "think": 2, "variant": 2,
+        "mode": 3, "think": 2, "variant": 4,
         "ticket": "e6fa609c3fa255c0",
         "ticket_key": "pro",
         "desc": "Pro model (medium thinking effort)",
     },
     "gemini-3.1-pro-high": {
-        "mode": 3, "think": 0, "variant": 3,
+        "mode": 3, "think": 0, "variant": 2,
         "ticket": "e6fa609c3fa255c0",
         "ticket_key": "pro",
         "desc": "Pro model (high thinking effort)",
@@ -191,12 +200,24 @@ MODELS = {
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4, "variant": 0,
-        "ticket": "56fdd199312815e2",
+        "mode": 6, "think": 4, "variant": 1,
+        "ticket": "8c46e95b1a07cecc",
         "ticket_key": "flash_lite",
         "desc": "Lightweight fast model",
     },
 }
+
+
+def normalize_model_name(model_name: str) -> str:
+    if not isinstance(model_name, str):
+        return ""
+    name = model_name.strip()
+    if "/" in name and name not in MODELS:
+        candidate = name.rsplit("/", 1)[-1]
+        base_candidate = candidate.rsplit("@think=", 1)[0]
+        if base_candidate in MODELS:
+            return candidate
+    return name
 
 
 def resolve_ticket_hex(cfg: dict, model_name: str = None, model_tickets: dict = None) -> Optional[str]:
@@ -251,14 +272,106 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_HEX_TICKET_ENTRY_RE = re.compile(
+    r'\[\s*(?:null\s*,\s*)?\\?"([0-9a-f]{16})\\?"\s*,\s*(?:null\s*,\s*)?\\?"([^"\\]{2,80})\\?"',
+    re.IGNORECASE,
+)
+_MODEL_NAME_TOKEN_RE = re.compile(
+    r'^(?:gemini[\s\-_]*(?:\d+(?:\.\d+)?[\s\-_]*)?)?'
+    r'(argon|ultra|pro|thinking|reasoning|flash[\s\-_]*lite|flash|fast)\b',
+    re.IGNORECASE,
+)
+
+
+def _classify_model_ticket_label(label: str):
+    if not isinstance(label, str):
+        return None
+    cleaned = label.strip()
+    if not cleaned:
+        return None
+    lower = cleaned.lower()
+    m = _MODEL_NAME_TOKEN_RE.match(cleaned)
+    if not m and "gemini" in lower:
+        if re.search(r"\b(argon|ultra)\b", lower):
+            return "argon"
+        if re.search(r"\bpro\b", lower):
+            return "pro"
+        if re.search(r"\b(thinking|reasoning)\b", lower):
+            return "thinking"
+        if re.search(r"\blite\b", lower):
+            return "flash_lite"
+        if re.search(r"\b(flash|fast)\b", lower):
+            return "flash"
+        return None
+    if not m:
+        return None
+    token = m.group(1).lower().replace("-", "_").replace(" ", "_")
+    if token in ("argon", "ultra"):
+        return "argon"
+    if token == "pro":
+        return "pro"
+    if token in ("thinking", "reasoning"):
+        return "thinking"
+    if "lite" in token:
+        return "flash_lite"
+    if token in ("flash", "fast"):
+        return "flash"
+    return None
+
+
+def discover_model_tickets_from_html(html: str) -> dict:
+    discovered = {}
+    if not html:
+        return discovered
+    for hex_id, label in _HEX_TICKET_ENTRY_RE.findall(html):
+        bucket = _classify_model_ticket_label(label)
+        if not bucket:
+            continue
+        hex_lower = hex_id.lower()
+        is_gemini_prefixed = "gemini" in label.lower()
+        if bucket == "argon" and (is_gemini_prefixed or "argon" not in discovered):
+            discovered["argon"] = hex_lower
+            discovered["gemini-4-argon"] = hex_lower
+        elif bucket == "pro" and (is_gemini_prefixed or "pro" not in discovered):
+            discovered["pro"] = hex_lower
+            discovered["gemini-3.1-pro"] = hex_lower
+        elif bucket == "thinking" and (is_gemini_prefixed or "thinking" not in discovered):
+            discovered["thinking"] = hex_lower
+        elif bucket == "flash_lite" and (is_gemini_prefixed or "flash_lite" not in discovered):
+            discovered["flash_lite"] = hex_lower
+        elif bucket == "flash" and (is_gemini_prefixed or "flash" not in discovered):
+            discovered["flash"] = hex_lower
+    return discovered
+
+
+def _parse_netscape_cookies(raw: str) -> str:
+    pairs = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain = parts[0].lstrip(".").lower()
+            if domain == "google.com" or domain.endswith(".google.com"):
+                pairs[parts[5]] = parts[6]
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from file with mtime-based caching. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
+    if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
+        mtime = os.path.getmtime(cookie_file)
+        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+            return _cookie_cache["str"], _cookie_cache["sapisid"]
         with open(cookie_file, "r", encoding="utf-8") as f:
             content = f.read().strip()
         if content.startswith("{"):
@@ -269,12 +382,15 @@ def load_cookie() -> tuple:
                 CONFIG["xsrf_token"] = data["xsrf_token"]
             if data.get("gemini_bl"):
                 CONFIG["gemini_bl"] = data["gemini_bl"]
-            if data.get("auth_user") is not None:
+            if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
                 CONFIG["auth_user"] = str(data["auth_user"])
             if isinstance(data.get("model_tickets"), dict):
                 tickets = dict(CONFIG.get("model_tickets") or {})
                 tickets.update(data["model_tickets"])
                 CONFIG["model_tickets"] = tickets
+        elif "\t" in content:
+            cookie_str = _parse_netscape_cookies(content)
+            sapisid = ""
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -282,10 +398,11 @@ def load_cookie() -> tuple:
         if not sapisid and cookie_str:
             m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
             sapisid = m.group(1) if m else ""
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return "", None
+        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -312,11 +429,11 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 
 def fetch_latest_bl() -> Optional[str]:
-    """Fetch the latest gemini_bl and xsrf_token from gemini.google.com page."""
+    """Fetch the latest gemini_bl, xsrf_token, and model tickets from gemini.google.com page."""
     try:
+        cookie_str, sapisid = load_cookie()
         prefix = account_prefix()
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        cookie_str, sapisid = load_cookie()
         if cookie_str:
             headers["Cookie"] = cookie_str
         if sapisid:
@@ -337,7 +454,14 @@ def fetch_latest_bl() -> Optional[str]:
         at_m = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
         if at_m:
             CONFIG["xsrf_token"] = at_m.group(1)
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        discovered = discover_model_tickets_from_html(html)
+        if discovered:
+            tickets = dict(CONFIG.get("model_tickets") or {})
+            tickets.update(discovered)
+            CONFIG["model_tickets"] = tickets
+        m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', html) or re.search(
+            r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html
+        )
         if m:
             return m.group(1)
     except Exception as e:
@@ -346,13 +470,21 @@ def fetch_latest_bl() -> Optional[str]:
 
 
 def update_bl_if_needed() -> bool:
-    """Attempt to fetch and update gemini_bl. Returns True if updated."""
+    """Attempt to fetch and update gemini_bl / xsrf_token / model_tickets."""
+    old_bl = CONFIG.get("gemini_bl")
+    old_xsrf = CONFIG.get("xsrf_token")
+    old_tickets = dict(CONFIG.get("model_tickets") or {})
     new_bl = fetch_latest_bl()
-    if new_bl and new_bl != CONFIG["gemini_bl"]:
-        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+    changed = False
+    if new_bl and new_bl != old_bl:
+        log(f"BL auto-updated: {old_bl} -> {new_bl}")
         CONFIG["gemini_bl"] = new_bl
-        return True
-    return False
+        changed = True
+    if CONFIG.get("xsrf_token") != old_xsrf:
+        changed = True
+    if (CONFIG.get("model_tickets") or {}) != old_tickets:
+        changed = True
+    return changed
 
 
 def upload_images(images: list) -> list:
@@ -703,11 +835,11 @@ def image_from_part(part: dict):
     return None
 
 
-def messages_to_prompt(messages: list, tools: list = None) -> tuple:
+def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list)."""
     parts = []
     images = []
-    if tools:
+    if tools and tool_choice != "none":
         tool_defs = []
         for tool in tools:
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
@@ -717,13 +849,17 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
-            tools_json = json.dumps(tool_defs, ensure_ascii=False)
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json) > PROMPT_MAX_BYTES // 2:
+                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
+                tools_json = json.dumps(slim_defs, indent=2)
+                log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
             parts.append(
                 "[System instruction]: You have access to tools. "
-                "To call a tool, respond ONLY with one or more blocks in this exact format:\n"
+                "To call a tool, respond with:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "Use the exact tool name and parameter names from the definitions below.\n"
-                f"Available tools: {tools_json}"
+                "Only use tool_call blocks when needed.\n\n"
+                f"Available tools:\n{tools_json}"
             )
     for msg in messages:
         role = msg.get("role", "user")
@@ -798,24 +934,41 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(part for part in parts if part), images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks across all common fence formats."""
+def parse_tool_calls(text: str, allowed_tools=None) -> tuple:
+    """Extract tool_call blocks across common fence formats."""
     tool_calls = []
+    allowed_set = set(allowed_tools) if allowed_tools is not None else None
 
-    def _add_call(data):
-        if isinstance(data, dict) and "name" in data:
+    def _normalize_args(raw_args):
+        if raw_args is None:
+            return "{}"
+        if isinstance(raw_args, str):
+            stripped_arg = raw_args.strip()
+            if not stripped_arg:
+                return "{}"
+            try:
+                parsed = json.loads(stripped_arg)
+                if isinstance(parsed, dict):
+                    return json.dumps(parsed, ensure_ascii=False)
+                return json.dumps({"value": parsed}, ensure_ascii=False)
+            except Exception:
+                return json.dumps({"value": raw_args}, ensure_ascii=False)
+        if isinstance(raw_args, dict):
+            return json.dumps(raw_args, ensure_ascii=False)
+        return json.dumps({"value": raw_args}, ensure_ascii=False)
+
+    def _add_call(data, require_allowed=False):
+        if isinstance(data, dict) and isinstance(data.get("name"), str) and data["name"]:
+            name = data["name"]
+            if require_allowed and allowed_set is not None and name not in allowed_set:
+                return False
             args = data.get("arguments", data.get("args", {}))
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args,
+                    "name": name,
+                    "arguments": _normalize_args(args),
                 },
             })
             return True
@@ -845,7 +998,7 @@ def parse_tool_calls(text: str) -> tuple:
         try:
             data = json.loads(m.group(1).strip())
             if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data):
+                if _add_call(data, require_allowed=True):
                     matched_spans.append(m.span())
         except Exception:
             pass
@@ -859,7 +1012,7 @@ def parse_tool_calls(text: str) -> tuple:
     for m in pattern4.finditer(text):
         try:
             args = json.loads(m.group(2))
-            _add_call({"name": m.group(1), "arguments": args})
+            _add_call({"name": m.group(1), "arguments": args}, require_allowed=True)
         except Exception:
             pass
     if tool_calls:
@@ -870,12 +1023,12 @@ def parse_tool_calls(text: str) -> tuple:
         try:
             data = json.loads(stripped)
             if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data):
+                if _add_call(data, require_allowed=True):
                     return "", tool_calls
         except Exception:
             pass
 
-    return text, []
+    return text.strip(), []
 
 
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
@@ -995,38 +1148,44 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _resolve_model(self, model_name, reasoning_effort=None):
+        load_cookie()
+        fallback = CONFIG.get("default_model", "gemini-3.6-flash")
+        if fallback not in MODELS:
+            fallback = "gemini-3.6-flash"
+        model_name = normalize_model_name(model_name or fallback)
         think_override = None
         variant_override = None
+        if reasoning_effort:
+            effort_key = str(reasoning_effort).strip().lower()
+            if effort_key in REASONING_EFFORT_MAP:
+                think_override, variant_override = REASONING_EFFORT_MAP[effort_key]
         if model_name and "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
             try:
                 think_override = int(think_str)
+                if think_override in THINK_TO_VARIANT:
+                    variant_override = THINK_TO_VARIANT[think_override]
             except ValueError:
                 return None, None, None, f"Invalid think level: {think_str}", None
-        if reasoning_effort:
-            effort_key = str(reasoning_effort).strip().lower()
-            if effort_key in REASONING_EFFORT_MAP:
-                effort_think, effort_variant = REASONING_EFFORT_MAP[effort_key]
-                if think_override is None:
-                    think_override = effort_think
-                variant_override = effort_variant
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}", None
+            log(f"Unknown model '{model_name}', falling back to '{fallback}'")
+            model_name = fallback
+            cfg = MODELS[fallback]
+        mode_id = cfg["mode"]
         extra = dict(cfg.get("extra") or {})
-        effective_variant = variant_override if variant_override is not None else cfg.get("variant")
-        if effective_variant is not None and (80 not in extra or variant_override is not None):
-            extra[80] = effective_variant
-        ticket_header = build_model_ticket(
-            cfg,
-            model_name=model_name,
-            variant_override=effective_variant,
-        )
-        if ticket_header:
-            extra["_ticket"] = ticket_header
+        effective_variant = variant_override if variant_override is not None else cfg.get("variant", 1)
+        if CONFIG.get("send_model_ticket", True):
+            ticket_header = build_model_ticket(
+                cfg,
+                model_name=model_name,
+                variant_override=effective_variant,
+            )
+            if ticket_header:
+                extra["_ticket"] = ticket_header
         return (
             model_name,
-            cfg["mode"],
+            mode_id,
             (think_override if think_override is not None else cfg["think"]),
             None,
             extra,
@@ -1041,7 +1200,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return text or "", tool_calls
 
     def handle_chat(self, body: bytes):
-        req = json.loads(body)
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         reasoning_effort = _extract_reasoning_effort(req)
         model_name, model_id, think_mode, err, extra = self._resolve_model(
             req.get("model", CONFIG["default_model"]),
@@ -1052,7 +1215,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -1065,7 +1229,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        if stream and not tools:
+        if stream and (not tools or tool_choice == "none"):
             # True streaming: forward chunks as they arrive
             try:
                 self.send_response(200)
@@ -1132,7 +1296,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
-        req = json.loads(body)
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         reasoning_effort = _extract_reasoning_effort(req)
         model_name, model_id, think_mode, err, extra = self._resolve_model(
             req.get("model", CONFIG["default_model"]),
@@ -1273,7 +1441,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _handle_google_generate(self, body: bytes, stream: bool):
         """Handle Google native generateContent / streamGenerateContent."""
-        req = json.loads(body)
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         model_name = self._parse_google_model_from_path()
         if not model_name:
             self.send_json({"error": {"message": "model not specified in path"}}, 400)

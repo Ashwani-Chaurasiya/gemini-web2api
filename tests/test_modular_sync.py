@@ -473,9 +473,12 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(generate.call_args.args[1], 3)
+        self.assertEqual(generate.call_args.args[1], 8)
         self.assertEqual(generate.call_args.args[2], 0)
-        self.assertEqual(generate.call_args.args[4][80], 3)
+        ticket = json.loads(generate.call_args.args[4]["_ticket"])
+        self.assertEqual(ticket[4], "95a4c0abcba24364")
+        self.assertEqual(ticket[14], 8)
+        self.assertEqual(ticket[15], 2)
         chunks = [
             json.loads(line[len("data: "):])
             for line in body.splitlines()
@@ -500,48 +503,73 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
             self.assertEqual(MODELS[name]["mode"], single_file.MODELS[name]["mode"])
             self.assertEqual(MODELS[name]["think"], single_file.MODELS[name]["think"])
             self.assertEqual(MODELS[name].get("variant"), single_file.MODELS[name].get("variant"))
+            self.assertEqual(MODELS[name].get("ticket"), single_file.MODELS[name].get("ticket"))
 
     def test_argon_thinking_variants_and_reasoning_effort(self):
         name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="low")
         self.assertIsNone(err)
-        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 4, 1))
+        self.assertEqual((name, mode, think), ("gemini-4-argon", 8, 4))
+        self.assertEqual(json.loads(extra["_ticket"])[15], 1)
 
         name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="medium")
         self.assertIsNone(err)
-        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 2, 2))
+        self.assertEqual((name, mode, think), ("gemini-4-argon", 8, 2))
+        self.assertEqual(json.loads(extra["_ticket"])[15], 4)
 
         name, mode, think, err, extra = resolve_model("gemini-4-argon", reasoning_effort="high")
         self.assertIsNone(err)
-        self.assertEqual((name, mode, think, extra[80]), ("gemini-4-argon", 3, 0, 3))
-
+        self.assertEqual((name, mode, think), ("gemini-4-argon", 8, 0))
         ticket = json.loads(extra["_ticket"])
         self.assertEqual(len(ticket), 17)
-        self.assertEqual(ticket[14], 3)
-        self.assertEqual(ticket[15], 3)
+        self.assertEqual(ticket[4], "95a4c0abcba24364")
+        self.assertEqual(ticket[14], 8)
+        self.assertEqual(ticket[15], 2)
         headers = _build_headers(extra)
         self.assertIn("X-Goog-Ext-525001261-Jspb", headers)
 
         inner = _decode_payload(_build_payload("hi", mode, think, None, extra))
-        self.assertEqual(inner[79], 3)
-        self.assertEqual(inner[80], 3)
+        self.assertEqual(inner[79], 8)
+        self.assertIsNone(inner[80])
         self.assertEqual(inner[17], [[0]])
 
     def test_dynamic_ticket_discovery_and_override(self):
-        sample_html = '[["aa11bb22cc33dd44","Gemini 4 Argon"],["56fdd199312815e2","Gemini 3.8 Flash"]]'
+        sample_html = (
+            '[["1111222233334444","User Profile"],'
+            '["5555666677778888","Product Breakfast"],'
+            '["aa11bb22cc33dd44","Gemini 4 Argon"],'
+            '[null,"56fdd199312815e2","Gemini 3.8 Flash"]]'
+        )
         discovered = discover_model_tickets_from_html(sample_html)
         self.assertEqual(discovered.get("argon"), "aa11bb22cc33dd44")
         self.assertEqual(discovered.get("gemini-4-argon"), "aa11bb22cc33dd44")
+        self.assertEqual(discovered.get("flash"), "56fdd199312815e2")
+        self.assertNotIn("pro", discovered)
 
         _, _, _, _, extra = resolve_model("gemini-4-argon", model_tickets=discovered)
         ticket = json.loads(extra["_ticket"])
         self.assertEqual(ticket[4], "aa11bb22cc33dd44")
 
-    def test_parse_tool_calls_supports_multiple_formats(self):
-        clean, calls = parse_tool_calls('Hello\n```json\n{"name": "bash", "args": {"command": "ls"}}\n```')
+    def test_provider_prefixed_model_and_think_variant_sync(self):
+        name, mode, think, err, extra = resolve_model("gemini-web/gemini-4-argon@think=0")
+        self.assertIsNone(err)
+        self.assertEqual((name, mode, think), ("gemini-4-argon", 8, 0))
+        self.assertEqual(json.loads(extra["_ticket"])[15], 2)
+
+    def test_parse_tool_calls_supports_multiple_formats_and_filters_unknown_json(self):
+        clean, calls = parse_tool_calls(
+            'Hello\n```json\n{"name": "bash", "args": {"command": "ls"}}\n```',
+            allowed_tools={"bash"},
+        )
         self.assertEqual(clean, "Hello")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "bash")
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": "ls"})
+
+        # Arbitrary JSON with "name"/"args" not in allowed_tools must not become a tool call
+        prose = 'Example:\n```json\n{"name": "widget", "args": {"a": 1}}\n```'
+        clean2, calls2 = parse_tool_calls(prose, allowed_tools={"bash"})
+        self.assertEqual(calls2, [])
+        self.assertEqual(clean2, prose)
 
 
 if __name__ == "__main__":

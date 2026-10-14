@@ -14,6 +14,18 @@ from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
 
+def _extract_tool_names(tools: list) -> set:
+    names = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", t) if t.get("type") == "function" else t
+        name = fn.get("name", t.get("name", ""))
+        if name:
+            names.add(name)
+    return names
+
+
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
@@ -257,7 +269,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, allowed_tools=_extract_tool_names(tools))
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -357,7 +369,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, allowed_tools=_extract_tool_names(tools))
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"

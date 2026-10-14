@@ -229,23 +229,52 @@ async function readGeminiPageMetadata(tabs) {
 
         const modelTickets = {};
         try {
-          const ticketRe = /\[\s*\\?"([0-9a-f]{16})\\?"\s*,\s*\\?"([^"\\]{1,80})\\?"/gi;
+          const classifyTicketLabel = (rawLabel) => {
+            if (!rawLabel || typeof rawLabel !== "string") return null;
+            const cleaned = rawLabel.trim();
+            if (!cleaned) return null;
+            const lower = cleaned.toLowerCase();
+            const tokenMatch = cleaned.match(
+              /^(?:gemini[\s\-_]*(?:\d+(?:\.\d+)?[\s\-_]*)?)?(argon|ultra|pro|thinking|reasoning|flash[\s\-_]*lite|flash|fast)\b/i
+            );
+            if (!tokenMatch) {
+              if (!lower.includes("gemini")) return null;
+              if (/\b(argon|ultra)\b/.test(lower)) return "argon";
+              if (/\bpro\b/.test(lower)) return "pro";
+              if (/\b(thinking|reasoning)\b/.test(lower)) return "thinking";
+              if (/\blite\b/.test(lower)) return "flash_lite";
+              if (/\b(flash|fast)\b/.test(lower)) return "flash";
+              return null;
+            }
+            const token = tokenMatch[1].toLowerCase().replace(/[\s\-]+/g, "_");
+            if (token === "argon" || token === "ultra") return "argon";
+            if (token === "pro") return "pro";
+            if (token === "thinking" || token === "reasoning") return "thinking";
+            if (token.includes("lite")) return "flash_lite";
+            if (token === "flash" || token === "fast") return "flash";
+            return null;
+          };
+
+          const ticketRe = /\[\s*(?:null\s*,\s*)?\\?"([0-9a-f]{16})\\?"\s*,\s*(?:null\s*,\s*)?\\?"([^"\\]{2,80})\\?"/gi;
           let m;
           while ((m = ticketRe.exec(html)) !== null) {
             const hexId = m[1].toLowerCase();
-            const label = m[2].trim().toLowerCase();
-            if (label.includes("argon") || label.includes("ultra")) {
-              if (!modelTickets.argon) modelTickets.argon = hexId;
-              if (!modelTickets["gemini-4-argon"]) modelTickets["gemini-4-argon"] = hexId;
-            } else if (label.includes("pro")) {
-              if (!modelTickets.pro) modelTickets.pro = hexId;
-              if (!modelTickets["gemini-3.1-pro"]) modelTickets["gemini-3.1-pro"] = hexId;
-            } else if (label.includes("thinking") || label.includes("reasoning")) {
-              if (!modelTickets.thinking) modelTickets.thinking = hexId;
-            } else if (label.includes("lite")) {
-              if (!modelTickets.flash_lite) modelTickets.flash_lite = hexId;
-            } else if (label.includes("flash") || label.includes("fast")) {
-              if (!modelTickets.flash) modelTickets.flash = hexId;
+            const label = m[2].trim();
+            const bucket = classifyTicketLabel(label);
+            if (!bucket) continue;
+            const isGeminiPrefixed = label.toLowerCase().includes("gemini");
+            if (bucket === "argon" && (isGeminiPrefixed || !modelTickets.argon)) {
+              modelTickets.argon = hexId;
+              modelTickets["gemini-4-argon"] = hexId;
+            } else if (bucket === "pro" && (isGeminiPrefixed || !modelTickets.pro)) {
+              modelTickets.pro = hexId;
+              modelTickets["gemini-3.1-pro"] = hexId;
+            } else if (bucket === "thinking" && (isGeminiPrefixed || !modelTickets.thinking)) {
+              modelTickets.thinking = hexId;
+            } else if (bucket === "flash_lite" && (isGeminiPrefixed || !modelTickets.flash_lite)) {
+              modelTickets.flash_lite = hexId;
+            } else if (bucket === "flash" && (isGeminiPrefixed || !modelTickets.flash)) {
+              modelTickets.flash = hexId;
             }
           }
         } catch {

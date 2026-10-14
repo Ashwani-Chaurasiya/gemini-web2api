@@ -168,24 +168,41 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks across all common fence formats. Returns (clean_text, tool_calls_list)."""
+def parse_tool_calls(text: str, allowed_tools=None) -> tuple:
+    """Extract tool_call blocks across common fence formats. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
+    allowed_set = set(allowed_tools) if allowed_tools is not None else None
 
-    def _add_call(data):
-        if isinstance(data, dict) and "name" in data:
+    def _normalize_args(raw_args):
+        if raw_args is None:
+            return "{}"
+        if isinstance(raw_args, str):
+            stripped_arg = raw_args.strip()
+            if not stripped_arg:
+                return "{}"
+            try:
+                parsed = json.loads(stripped_arg)
+                if isinstance(parsed, dict):
+                    return json.dumps(parsed, ensure_ascii=False)
+                return json.dumps({"value": parsed}, ensure_ascii=False)
+            except Exception:
+                return json.dumps({"value": raw_args}, ensure_ascii=False)
+        if isinstance(raw_args, dict):
+            return json.dumps(raw_args, ensure_ascii=False)
+        return json.dumps({"value": raw_args}, ensure_ascii=False)
+
+    def _add_call(data, require_allowed=False):
+        if isinstance(data, dict) and isinstance(data.get("name"), str) and data["name"]:
+            name = data["name"]
+            if require_allowed and allowed_set is not None and name not in allowed_set:
+                return False
             args = data.get("arguments", data.get("args", {}))
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args,
+                    "name": name,
+                    "arguments": _normalize_args(args),
                 },
             })
             return True
@@ -215,7 +232,7 @@ def parse_tool_calls(text: str) -> tuple:
         try:
             data = json.loads(m.group(1).strip())
             if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data):
+                if _add_call(data, require_allowed=True):
                     matched_spans.append(m.span())
         except (json.JSONDecodeError, KeyError):
             pass
@@ -229,7 +246,7 @@ def parse_tool_calls(text: str) -> tuple:
     for m in pattern4.finditer(text):
         try:
             args = json.loads(m.group(2))
-            _add_call({"name": m.group(1), "arguments": args})
+            _add_call({"name": m.group(1), "arguments": args}, require_allowed=True)
         except (json.JSONDecodeError, KeyError):
             pass
     if tool_calls:
@@ -240,12 +257,12 @@ def parse_tool_calls(text: str) -> tuple:
         try:
             data = json.loads(stripped)
             if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data):
+                if _add_call(data, require_allowed=True):
                     return "", tool_calls
         except (json.JSONDecodeError, KeyError):
             pass
 
-    return text, []
+    return text.strip(), []
 
 
 # ─── Google Native API helpers ─────────────────────────────────────────────────
