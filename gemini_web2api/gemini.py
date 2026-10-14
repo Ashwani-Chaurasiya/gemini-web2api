@@ -179,8 +179,10 @@ def update_cookie_payload(data: dict) -> bool:
         cookie_str = data["cookie"]
         sapisid = data.get("sapisid", "")
         if not sapisid and cookie_str:
-            m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
+            m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
             sapisid = m.group(1) if m else ""
+        if cookie_str == _cookie_cache.get("str") and not data.get("xsrf_token") and not data.get("gemini_bl"):
+            return True
         if data.get("xsrf_token"):
             CONFIG["xsrf_token"] = data["xsrf_token"]
         if data.get("gemini_bl"):
@@ -194,8 +196,15 @@ def update_cookie_payload(data: dict) -> bool:
         cf = CONFIG.get("cookie_file")
         if cf:
             try:
+                existing = {}
+                if os.path.exists(cf):
+                    with open(cf, "r", encoding="utf-8") as rf:
+                        raw_existing = rf.read().strip()
+                        if raw_existing.startswith("{"):
+                            existing = json.loads(raw_existing)
+                existing.update({k: v for k, v in data.items() if v is not None})
                 with open(cf, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    json.dump(existing, f, ensure_ascii=False, indent=2)
                 mtime = os.path.getmtime(cf)
             except Exception:
                 mtime = time.time()

@@ -108,7 +108,7 @@ def _compact_tool_defs(tool_defs: list) -> list:
     """Compact verbose tool schemas while preserving parameter names and required flags."""
     compacted = []
     for t in tool_defs:
-        desc = (t.get("description") or "").strip().splitlines()[0][:120]
+        desc = (t.get("description") or "").strip().split("\n")[0][:120]
         schema = t.get("parameters") if isinstance(t.get("parameters"), dict) else {}
         props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         req_set = set(schema.get("required") or [])

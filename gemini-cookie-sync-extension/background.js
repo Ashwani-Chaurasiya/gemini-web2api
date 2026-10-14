@@ -1,5 +1,5 @@
 // Background Service Worker: Auto-syncs rotated Gemini cookies to local gemini-web2api server
-const KEY_COOKIES = ["SID", "__Secure-1PSID", "__Secure-1PSIDTS", "SAPISID", "SIDCC", "__Secure-1PSIDCC"];
+const KEY_COOKIES = ["SID", "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-3PSIDTS", "SAPISID"];
 const PREFERRED_ORDER = [
   "SID", "HSID", "SSID", "APISID", "SAPISID",
   "__Secure-1PSID", "__Secure-3PSID",
@@ -10,6 +10,7 @@ const PREFERRED_ORDER = [
 ];
 const LOCAL_ENDPOINTS = ["http://127.0.0.1:8081/v1/cookies"];
 let debounceTimer = null;
+let lastKeySignature = "";
 
 async function syncCookiesToLocalServer() {
   try {
@@ -28,6 +29,10 @@ async function syncCookiesToLocalServer() {
     const sapisid = selected.get("SAPISID")?.value;
     const psid = selected.get("__Secure-1PSID")?.value;
     if (!sapisid || !psid) return;
+
+    const sig = KEY_COOKIES.map((k) => `${k}=${selected.get(k)?.value || ""}`).join(";");
+    if (sig === lastKeySignature) return;
+    lastKeySignature = sig;
 
     const ordered = [];
     const seen = new Set();
