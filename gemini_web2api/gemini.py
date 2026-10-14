@@ -326,6 +326,21 @@ def refresh_bl_and_xsrf() -> bool:
             if at_m:
                 CONFIG["xsrf_token"] = at_m.group(1)
                 updated = True
+            cf = CONFIG.get("cookie_file")
+            if updated and cf and os.path.exists(cf):
+                with _cookie_lock:
+                    try:
+                        with open(cf, "r", encoding="utf-8") as rf:
+                            raw_cf = rf.read().strip()
+                        if raw_cf.startswith("{"):
+                            cf_data = json.loads(raw_cf)
+                            cf_data["gemini_bl"] = CONFIG["gemini_bl"]
+                            cf_data["xsrf_token"] = CONFIG["xsrf_token"]
+                            with open(cf, "w", encoding="utf-8") as wf:
+                                json.dump(cf_data, wf, ensure_ascii=False, indent=2)
+                            _cookie_cache["mtime"] = os.path.getmtime(cf)
+                    except Exception:
+                        pass
             return updated
         except Exception as e:
             log(f"BL/XSRF auto-refresh failed: {e}")
