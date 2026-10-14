@@ -15,6 +15,7 @@
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false,
+  "persistent_chat": true,
   "send_model_ticket": true,
   "model_tickets": {}
 }

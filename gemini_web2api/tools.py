@@ -101,6 +101,25 @@ def _image_from_part(part: dict):
     return None
 
 
+PROMPT_MAX_BYTES = 60000
+
+
+def _compact_tool_defs(tool_defs: list) -> list:
+    """Compact verbose tool schemas while preserving parameter names and required flags."""
+    compacted = []
+    for t in tool_defs:
+        desc = (t.get("description") or "").strip().splitlines()[0][:120]
+        schema = t.get("parameters") if isinstance(t.get("parameters"), dict) else {}
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        req_set = set(schema.get("required") or [])
+        params = {
+            k: f"{(v.get('type') if isinstance(v, dict) else 'any') or 'any'}{'*' if k in req_set else ''}"
+            for k, v in props.items()
+        }
+        compacted.append({"name": t.get("name", ""), "description": desc, "parameters": params})
+    return compacted
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -120,12 +139,15 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             })
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json) > PROMPT_MAX_BYTES // 3:
+                tools_json = json.dumps(_compact_tool_defs(tool_defs), ensure_ascii=False)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
 
@@ -168,100 +190,62 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
+def messages_to_delta_prompt(messages: list, start_idx: int) -> tuple:
+    """Format only the new messages since start_idx for an active persistent_chat window."""
+    return messages_to_prompt(messages[start_idx:], tools=None, tool_choice="none")
+
+
 def parse_tool_calls(text: str, allowed_tools=None) -> tuple:
     """Extract tool_call blocks across common fence formats. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
     allowed_set = set(allowed_tools) if allowed_tools is not None else None
 
-    def _normalize_args(raw_args):
-        if raw_args is None:
-            return "{}"
-        if isinstance(raw_args, str):
-            stripped_arg = raw_args.strip()
-            if not stripped_arg:
-                return "{}"
-            try:
-                parsed = json.loads(stripped_arg)
-                if isinstance(parsed, dict):
-                    return json.dumps(parsed, ensure_ascii=False)
-                return json.dumps({"value": parsed}, ensure_ascii=False)
-            except Exception:
-                return json.dumps({"value": raw_args}, ensure_ascii=False)
-        if isinstance(raw_args, dict):
-            return json.dumps(raw_args, ensure_ascii=False)
-        return json.dumps({"value": raw_args}, ensure_ascii=False)
-
     def _add_call(data, require_allowed=False):
-        if isinstance(data, dict) and isinstance(data.get("name"), str) and data["name"]:
-            name = data["name"]
-            if require_allowed and allowed_set is not None and name not in allowed_set:
-                return False
-            args = data.get("arguments", data.get("args", {}))
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": _normalize_args(args),
-                },
-            })
-            return True
-        return False
+        if not (isinstance(data, dict) and isinstance(data.get("name"), str) and data["name"]):
+            return False
+        name = data["name"]
+        if require_allowed and (allowed_set is None or name not in allowed_set):
+            return False
+        args = data.get("arguments", data.get("args", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"value": args}
+        if not isinstance(args, dict):
+            args = {} if args is None else {"value": args}
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+        return True
 
-    pattern1 = re.compile(r'```tool_call\s*\n(.*?)\n```', re.DOTALL)
-    for m in pattern1.finditer(text):
-        try:
-            _add_call(json.loads(m.group(1).strip()))
-        except (json.JSONDecodeError, KeyError):
-            pass
-    if tool_calls:
-        return pattern1.sub('', text).strip(), tool_calls
-
-    pattern2 = re.compile(r'```(?:function_call|tool_calls?)\s*\n(.*?)\n```', re.DOTALL)
-    for m in pattern2.finditer(text):
-        try:
-            _add_call(json.loads(m.group(1).strip()))
-        except (json.JSONDecodeError, KeyError):
-            pass
-    if tool_calls:
-        return pattern2.sub('', text).strip(), tool_calls
-
-    pattern3 = re.compile(r'```json\s*\n(\s*\{.*?\}\s*)\n```', re.DOTALL)
-    matched_spans = []
-    for m in pattern3.finditer(text):
-        try:
-            data = json.loads(m.group(1).strip())
-            if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data, require_allowed=True):
-                    matched_spans.append(m.span())
-        except (json.JSONDecodeError, KeyError):
-            pass
-    if tool_calls:
-        clean = text
-        for start, end in reversed(matched_spans):
-            clean = clean[:start] + clean[end:]
-        return clean.strip(), tool_calls
-
-    pattern4 = re.compile(r'\[(?:tool_call|function_call):\s*(\w+)\((\{.*?\})\)\s*\]', re.DOTALL)
-    for m in pattern4.finditer(text):
-        try:
-            args = json.loads(m.group(2))
-            _add_call({"name": m.group(1), "arguments": args}, require_allowed=True)
-        except (json.JSONDecodeError, KeyError):
-            pass
-    if tool_calls:
-        return pattern4.sub('', text).strip(), tool_calls
+    for pat_str, req_allow in [
+        (r'```(?:tool_call|function_call|tool_calls)\s*\n(.*?)\n```', False),
+        (r'```json\s*\n(\s*\{.*?\}\s*)\n```', True),
+    ]:
+        pat = re.compile(pat_str, re.DOTALL)
+        spans = []
+        for m in pat.finditer(text):
+            try:
+                if _add_call(json.loads(m.group(1).strip()), require_allowed=req_allow):
+                    spans.append(m.span())
+            except (json.JSONDecodeError, KeyError):
+                pass
+        if tool_calls:
+            clean = text
+            for s, e in reversed(spans):
+                clean = clean[:s] + clean[e:]
+            return clean.strip(), tool_calls
 
     stripped = text.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
-            data = json.loads(stripped)
-            if "name" in data and ("arguments" in data or "args" in data):
-                if _add_call(data, require_allowed=True):
-                    return "", tool_calls
+            if _add_call(json.loads(stripped), require_allowed=True):
+                return "", tool_calls
         except (json.JSONDecodeError, KeyError):
             pass
-
     return text.strip(), []
 
 

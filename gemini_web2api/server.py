@@ -8,8 +8,22 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .gemini import (
+    _chat_window,
+    generate,
+    generate_stream,
+    get_last_conv_ids,
+    log,
+    set_last_conv_ids,
+    update_cookie_payload,
+)
+from .tools import (
+    messages_to_delta_prompt,
+    messages_to_prompt,
+    parse_tool_calls,
+    google_contents_to_prompt,
+    parse_google_function_calls,
+)
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
@@ -184,6 +198,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/cookies":
+                req = self._parse_body(body)
+                if req and update_cookie_payload(req):
+                    self.send_json({"status": "ok"})
+                else:
+                    self.send_json({"error": {"message": "invalid cookie payload"}}, 400)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -216,7 +236,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        messages = req.get("messages", [])
+        use_persistent = bool(CONFIG.get("persistent_chat", False) and not CONFIG.get("temporary_chats", False))
+        extra_fields = dict(extra_fields or {})
+
+        if use_persistent:
+            with _chat_window.lock:
+                conv_meta, start_idx = _chat_window.get_continuation(messages, model_id, think_mode)
+                if conv_meta:
+                    extra_fields[2] = conv_meta
+                    prompt, images = messages_to_delta_prompt(messages, start_idx)
+                    log(f"[persistent_chat] Continuing conv={conv_meta[0]} from msg[{start_idx}:]")
+                else:
+                    _chat_window.reset()
+                    prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        else:
+            prompt, images = messages_to_prompt(messages, tools, tool_choice)
+
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -245,11 +281,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
+                streamed_parts = []
+                set_last_conv_ids(("", "", ""))
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    streamed_parts.append(delta)
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
+                if use_persistent:
+                    c_id, r_id, rc_id = get_last_conv_ids()
+                    with _chat_window.lock:
+                        _chat_window.update(c_id, r_id, rc_id, messages, "".join(streamed_parts), model_id, think_mode)
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
@@ -262,6 +305,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            set_last_conv_ids(("", "", ""))
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
@@ -273,6 +317,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        if use_persistent:
+            c_id, r_id, rc_id = get_last_conv_ids()
+            with _chat_window.lock:
+                _chat_window.update(c_id, r_id, rc_id, messages, msg, model_id, think_mode)
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:

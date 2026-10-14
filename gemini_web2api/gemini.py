@@ -25,15 +25,106 @@ _cookie_lock = threading.Lock()
 _refresh_lock = threading.Lock()
 _httpx_client = None
 
-_HEX_TICKET_ENTRY_RE = re.compile(
-    r'\[\s*(?:null\s*,\s*)?\\?"([0-9a-f]{16})\\?"\s*,\s*(?:null\s*,\s*)?\\?"([^"\\]{2,80})\\?"',
-    re.IGNORECASE,
-)
-_MODEL_NAME_TOKEN_RE = re.compile(
-    r'^(?:gemini[\s\-_]*(?:\d+(?:\.\d+)?[\s\-_]*)?)?'
-    r'(argon|ultra|pro|thinking|reasoning|flash[\s\-_]*lite|flash|fast)\b',
-    re.IGNORECASE,
-)
+
+class ChatWindow:
+    """Thread-safe multi-turn conversation state (c_xxx / r_xxx / rc_xxx)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.conv_id = ""
+        self.resp_id = ""
+        self.rcid = ""
+        self.sent_count = 0
+        self.prefix_hash = ""
+        self.model_id = None
+        self.think_mode = None
+
+    @staticmethod
+    def _hash_messages(messages: list) -> str:
+        h = hashlib.md5()
+        for m in messages:
+            role = m.get("role") or ""
+            raw_content = m.get("content")
+            content = "" if raw_content is None else str(raw_content)[:200]
+            tc_part = ""
+            if m.get("tool_calls"):
+                tc_names = [
+                    (tc.get("function") or {}).get("name", "")
+                    for tc in m["tool_calls"]
+                    if isinstance(tc, dict)
+                ]
+                tc_part = ",".join(tc_names)
+            h.update(f"{role}:{content}:{tc_part}|".encode("utf-8", errors="ignore"))
+        return h.hexdigest()[:16]
+
+    def get_continuation(self, messages: list, model_id: int, think_mode: int):
+        """Return (conv_meta_list, start_idx) if messages continue the active window."""
+        if not self.conv_id or len(messages) <= self.sent_count or self.sent_count == 0:
+            return None, 0
+        if model_id != self.model_id or think_mode != self.think_mode:
+            return None, 0
+        if self._hash_messages(messages[:self.sent_count]) != self.prefix_hash:
+            return None, 0
+        meta = [self.conv_id, self.resp_id, self.rcid, None, None, None, None, None, None, ""]
+        return meta, self.sent_count
+
+    def update(self, conv_id: str, resp_id: str, rcid: str, messages: list, assistant_msg, model_id: int, think_mode: int):
+        if not conv_id:
+            return
+        self.conv_id = conv_id
+        if resp_id:
+            self.resp_id = resp_id
+        if rcid:
+            self.rcid = rcid
+        if isinstance(assistant_msg, str):
+            assistant_msg = {"role": "assistant", "content": assistant_msg}
+        full_msgs = list(messages) + [assistant_msg]
+        self.sent_count = len(full_msgs)
+        self.prefix_hash = self._hash_messages(full_msgs)
+        self.model_id = model_id
+        self.think_mode = think_mode
+
+
+_chat_window = ChatWindow()
+_conv_tls = threading.local()
+
+
+def get_last_conv_ids() -> tuple:
+    return getattr(_conv_tls, "ids", ("", "", ""))
+
+
+def set_last_conv_ids(ids: tuple) -> None:
+    _conv_tls.ids = ids
+
+
+def extract_conv_ids_from_line(line: str) -> tuple:
+    """Extract (conv_id, resp_id, rcid) from a wrb.fr response line."""
+    if '"wrb.fr"' not in line or len(line) < 100:
+        return "", "", ""
+    conv_id = resp_id = rcid = ""
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return "", "", ""
+        inner = json.loads(inner_str)
+        if isinstance(inner, list) and len(inner) > 1 and isinstance(inner[1], list):
+            ids = inner[1]
+            if len(ids) >= 2:
+                if isinstance(ids[0], str) and ids[0].startswith("c_"):
+                    conv_id = ids[0]
+                if isinstance(ids[1], str) and ids[1].startswith("r_"):
+                    resp_id = ids[1]
+        if isinstance(inner, list) and len(inner) > 4 and inner[4]:
+            for part in inner[4]:
+                if isinstance(part, list) and len(part) > 0 and isinstance(part[0], str) and part[0].startswith("rc_"):
+                    rcid = part[0]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
+    return conv_id, resp_id, rcid
 
 
 def log(msg: str):
@@ -55,89 +146,22 @@ def _get_httpx_client():
     if _httpx_client is None and HAS_HTTPX:
         proxy = CONFIG.get("proxy")
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client = httpx.Client(
+            transport=transport,
+            timeout=CONFIG["request_timeout_sec"],
+            verify=True,
+            headers={"Connection": "close"},
+        )
     return _httpx_client
 
 
-def _classify_model_ticket_label(label: str):
-    """Classify a display name from WIZ_global_data into a model ticket bucket."""
-    if not isinstance(label, str):
-        return None
-    cleaned = label.strip()
-    if not cleaned:
-        return None
-    lower = cleaned.lower()
-    m = _MODEL_NAME_TOKEN_RE.match(cleaned)
-    if not m and "gemini" in lower:
-        if re.search(r"\b(argon|ultra)\b", lower):
-            return "argon"
-        if re.search(r"\bpro\b", lower):
-            return "pro"
-        if re.search(r"\b(thinking|reasoning)\b", lower):
-            return "thinking"
-        if re.search(r"\blite\b", lower):
-            return "flash_lite"
-        if re.search(r"\b(flash|fast)\b", lower):
-            return "flash"
-        return None
-    if not m:
-        return None
-    token = m.group(1).lower().replace("-", "_").replace(" ", "_")
-    if token in ("argon", "ultra"):
-        return "argon"
-    if token == "pro":
-        return "pro"
-    if token in ("thinking", "reasoning"):
-        return "thinking"
-    if "lite" in token:
-        return "flash_lite"
-    if token in ("flash", "fast"):
-        return "flash"
-    return None
-
-
-def discover_model_tickets_from_html(html: str) -> dict:
-    """Scan Gemini web page HTML / WIZ_global_data for 16-hex model tickets."""
-    discovered = {}
-    if not html:
-        return discovered
-    for hex_id, label in _HEX_TICKET_ENTRY_RE.findall(html):
-        bucket = _classify_model_ticket_label(label)
-        if not bucket:
-            continue
-        hex_lower = hex_id.lower()
-        # Prefer explicit "Gemini ..." labels over generic tier names
-        is_gemini_prefixed = "gemini" in label.lower()
-        if bucket == "argon":
-            if is_gemini_prefixed or "argon" not in discovered:
-                discovered["argon"] = hex_lower
-                discovered["gemini-4-argon"] = hex_lower
-        elif bucket == "pro":
-            if is_gemini_prefixed or "pro" not in discovered:
-                discovered["pro"] = hex_lower
-                discovered["gemini-3.1-pro"] = hex_lower
-        elif bucket == "thinking":
-            if is_gemini_prefixed or "thinking" not in discovered:
-                discovered["thinking"] = hex_lower
-        elif bucket == "flash_lite":
-            if is_gemini_prefixed or "flash_lite" not in discovered:
-                discovered["flash_lite"] = hex_lower
-        elif bucket == "flash":
-            if is_gemini_prefixed or "flash" not in discovered:
-                discovered["flash"] = hex_lower
-    return discovered
-
-
 def _parse_netscape_cookies(raw: str) -> str:
-    """Parse Netscape cookies.txt (including #HttpOnly_ entries) for google.com."""
     pairs = {}
     for line in raw.splitlines():
         line = line.strip()
-        if not line:
-            continue
         if line.startswith("#HttpOnly_"):
             line = line[len("#HttpOnly_"):]
-        elif line.startswith("#"):
+        elif not line or line.startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) >= 7:
@@ -145,6 +169,41 @@ def _parse_netscape_cookies(raw: str) -> str:
             if domain == "google.com" or domain.endswith(".google.com"):
                 pairs[parts[5]] = parts[6]
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
+def update_cookie_payload(data: dict) -> bool:
+    """Update in-memory and on-disk cookie state from a pushed extension payload."""
+    if not isinstance(data, dict) or not data.get("cookie"):
+        return False
+    with _cookie_lock:
+        cookie_str = data["cookie"]
+        sapisid = data.get("sapisid", "")
+        if not sapisid and cookie_str:
+            m = re.search(r"SAPISID=([^;\s]+)", cookie_str)
+            sapisid = m.group(1) if m else ""
+        if data.get("xsrf_token"):
+            CONFIG["xsrf_token"] = data["xsrf_token"]
+        if data.get("gemini_bl"):
+            CONFIG["gemini_bl"] = data["gemini_bl"]
+        if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
+            CONFIG["auth_user"] = str(data["auth_user"])
+        if isinstance(data.get("model_tickets"), dict):
+            tickets = dict(CONFIG.get("model_tickets") or {})
+            tickets.update(data["model_tickets"])
+            CONFIG["model_tickets"] = tickets
+        cf = CONFIG.get("cookie_file")
+        if cf:
+            try:
+                with open(cf, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                mtime = os.path.getmtime(cf)
+            except Exception:
+                mtime = time.time()
+        else:
+            mtime = time.time()
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        log("Updated cookies in memory and on disk via /v1/cookies")
+        return True
 
 
 def load_cookie() -> tuple:
@@ -197,7 +256,6 @@ def make_sapisidhash(sapisid: str) -> str:
 
 
 def _account_prefix() -> str:
-    """Return the Gemini account path prefix for non-default Google accounts."""
     auth_user = CONFIG.get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
@@ -226,7 +284,7 @@ def _build_headers(extra_fields: dict = None) -> dict:
 
 
 def refresh_bl_and_xsrf() -> bool:
-    """Refresh gemini_bl, xsrf_token, and model tickets from gemini.google.com."""
+    """Refresh gemini_bl and xsrf_token from gemini.google.com."""
     with _refresh_lock:
         try:
             cookie_str, sapisid = load_cookie()
@@ -259,12 +317,6 @@ def refresh_bl_and_xsrf() -> bool:
             if at_m:
                 CONFIG["xsrf_token"] = at_m.group(1)
                 updated = True
-            discovered = discover_model_tickets_from_html(html)
-            if discovered:
-                tickets = dict(CONFIG.get("model_tickets") or {})
-                tickets.update(discovered)
-                CONFIG["model_tickets"] = tickets
-                updated = True
             return updated
         except Exception as e:
             log(f"BL/XSRF auto-refresh failed: {e}")
@@ -272,7 +324,6 @@ def refresh_bl_and_xsrf() -> bool:
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
-    """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
         inner[41] = [1]
         inner[45] = 1
@@ -357,7 +408,6 @@ def extract_served_model_info(raw: str) -> tuple:
 
 
 def _extract_texts_from_line(line: str) -> list:
-    """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
         return []
     try:
@@ -380,7 +430,6 @@ def _extract_texts_from_line(line: str) -> list:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
@@ -388,16 +437,24 @@ def extract_response_text(raw: str) -> str:
     if hex_id or label:
         log(f"[model-verify] Served model: {label or 'unknown'} [{hex_id or 'no-hex'}]")
     last_text = ""
+    conv_id = resp_id = rcid = ""
     for line in raw.split("\n"):
+        c, r, rc = extract_conv_ids_from_line(line)
+        if c:
+            conv_id = c
+        if r:
+            resp_id = r
+        if rc:
+            rcid = rc
         for t in _extract_texts_from_line(line):
             cleaned = clean_text(t)
             if cleaned:
                 last_text = cleaned
+    set_last_conv_ids((conv_id, resp_id, rcid))
     return last_text
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
     load_cookie()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -442,7 +499,6 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
@@ -480,6 +536,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        c, r, rc = extract_conv_ids_from_line(line)
+                        if c or r or rc:
+                            prev_c, prev_r, prev_rc = get_last_conv_ids()
+                            set_last_conv_ids((c or prev_c, r or prev_r, rc or prev_rc))
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
@@ -492,6 +552,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
+            if emitted_raw_text:
+                raise
             attempt += 1
             if attempt < attempts:
                 log(f"Stream retry {attempt}/{attempts}: {e}")

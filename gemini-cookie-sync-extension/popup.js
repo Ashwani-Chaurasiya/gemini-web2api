@@ -227,60 +227,6 @@ async function readGeminiPageMetadata(tabs) {
         const xsrfToken = wiz.SNlM0e || regexValue("SNlM0e");
         const geminiBl = wiz.cfb2h || resourceBl || regexValue("cfb2h");
 
-        const modelTickets = {};
-        try {
-          const classifyTicketLabel = (rawLabel) => {
-            if (!rawLabel || typeof rawLabel !== "string") return null;
-            const cleaned = rawLabel.trim();
-            if (!cleaned) return null;
-            const lower = cleaned.toLowerCase();
-            const tokenMatch = cleaned.match(
-              /^(?:gemini[\s\-_]*(?:\d+(?:\.\d+)?[\s\-_]*)?)?(argon|ultra|pro|thinking|reasoning|flash[\s\-_]*lite|flash|fast)\b/i
-            );
-            if (!tokenMatch) {
-              if (!lower.includes("gemini")) return null;
-              if (/\b(argon|ultra)\b/.test(lower)) return "argon";
-              if (/\bpro\b/.test(lower)) return "pro";
-              if (/\b(thinking|reasoning)\b/.test(lower)) return "thinking";
-              if (/\blite\b/.test(lower)) return "flash_lite";
-              if (/\b(flash|fast)\b/.test(lower)) return "flash";
-              return null;
-            }
-            const token = tokenMatch[1].toLowerCase().replace(/[\s\-]+/g, "_");
-            if (token === "argon" || token === "ultra") return "argon";
-            if (token === "pro") return "pro";
-            if (token === "thinking" || token === "reasoning") return "thinking";
-            if (token.includes("lite")) return "flash_lite";
-            if (token === "flash" || token === "fast") return "flash";
-            return null;
-          };
-
-          const ticketRe = /\[\s*(?:null\s*,\s*)?\\?"([0-9a-f]{16})\\?"\s*,\s*(?:null\s*,\s*)?\\?"([^"\\]{2,80})\\?"/gi;
-          let m;
-          while ((m = ticketRe.exec(html)) !== null) {
-            const hexId = m[1].toLowerCase();
-            const label = m[2].trim();
-            const bucket = classifyTicketLabel(label);
-            if (!bucket) continue;
-            const isGeminiPrefixed = label.toLowerCase().includes("gemini");
-            if (bucket === "argon" && (isGeminiPrefixed || !modelTickets.argon)) {
-              modelTickets.argon = hexId;
-              modelTickets["gemini-4-argon"] = hexId;
-            } else if (bucket === "pro" && (isGeminiPrefixed || !modelTickets.pro)) {
-              modelTickets.pro = hexId;
-              modelTickets["gemini-3.1-pro"] = hexId;
-            } else if (bucket === "thinking" && (isGeminiPrefixed || !modelTickets.thinking)) {
-              modelTickets.thinking = hexId;
-            } else if (bucket === "flash_lite" && (isGeminiPrefixed || !modelTickets.flash_lite)) {
-              modelTickets.flash_lite = hexId;
-            } else if (bucket === "flash" && (isGeminiPrefixed || !modelTickets.flash)) {
-              modelTickets.flash = hexId;
-            }
-          }
-        } catch {
-          // Ignore model ticket regex scan errors.
-        }
-
         let source = null;
         if (wiz.SNlM0e || wiz.cfb2h) source = "WIZ_global_data";
         else if (resourceBl) source = "performance";
@@ -289,7 +235,6 @@ async function readGeminiPageMetadata(tabs) {
         return {
           xsrfToken: xsrfToken || null,
           geminiBl: geminiBl || null,
-          modelTickets,
           source,
           url: location.href
         };
@@ -440,9 +385,18 @@ exportButton.addEventListener("click", async () => {
       sapisid: info.selected.get("SAPISID").value,
       auth_user: info.authUser,
       xsrf_token: info.pageMetadata.xsrfToken,
-      gemini_bl: info.pageMetadata.geminiBl,
-      model_tickets: info.pageMetadata.modelTickets || {}
+      gemini_bl: info.pageMetadata.geminiBl
     };
+
+    try {
+      await fetch("http://127.0.0.1:8081/v1/cookies", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch {
+      // Ignore if local server is offline.
+    }
 
     await downloadJson("gemini-auth.json", payload);
 

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 import importlib.util
 from pathlib import Path
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_headers, _build_payload, discover_model_tickets_from_html
+from gemini_web2api.gemini import _build_headers, _build_payload
 from gemini_web2api.models import MODELS, build_model_ticket, resolve_model
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
@@ -532,22 +532,72 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
         self.assertIsNone(inner[80])
         self.assertEqual(inner[17], [[0]])
 
-    def test_dynamic_ticket_discovery_and_override(self):
-        sample_html = (
-            '[["1111222233334444","User Profile"],'
-            '["5555666677778888","Product Breakfast"],'
-            '["aa11bb22cc33dd44","Gemini 4 Argon"],'
-            '[null,"56fdd199312815e2","Gemini 3.8 Flash"]]'
-        )
-        discovered = discover_model_tickets_from_html(sample_html)
-        self.assertEqual(discovered.get("argon"), "aa11bb22cc33dd44")
-        self.assertEqual(discovered.get("gemini-4-argon"), "aa11bb22cc33dd44")
-        self.assertEqual(discovered.get("flash"), "56fdd199312815e2")
-        self.assertNotIn("pro", discovered)
+    def test_persistent_chat_window_continues_session_with_delta_only(self):
+        import urllib.request
+        from gemini_web2api.gemini import _chat_window, set_last_conv_ids
+        CONFIG["persistent_chat"] = True
+        _chat_window.reset()
 
-        _, _, _, _, extra = resolve_model("gemini-4-argon", model_tickets=discovered)
-        ticket = json.loads(extra["_ticket"])
-        self.assertEqual(ticket[4], "aa11bb22cc33dd44")
+        def fake_gen_turn1(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
+            set_last_conv_ids(("c_123", "r_456", "rc_789"))
+            return '```tool_call\n{"name": "read", "arguments": {"filePath": "a.py"}}\n```'
+
+        with mock.patch("gemini_web2api.server.generate", side_effect=fake_gen_turn1) as gen1:
+            from gemini_web2api.server import GeminiHandler, ThreadedServer
+            server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+            import threading
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                port = server.server_address[1]
+                tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
+                msgs1 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "turn1"}]
+                req1 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps({"model": "gemini-4-argon", "messages": msgs1, "tools": tools}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req1, timeout=5) as r1:
+                    resp1 = json.loads(r1.read().decode())
+                    self.assertEqual(r1.status, 200)
+                self.assertNotIn(2, gen1.call_args.args[4])
+
+                msgs2 = msgs1 + [
+                    resp1["choices"][0]["message"],
+                    {"role": "tool", "name": "read", "content": "file-body"},
+                ]
+                req2 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps({"model": "gemini-4-argon", "messages": msgs2, "tools": tools}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req2, timeout=5) as r2:
+                    self.assertEqual(r2.status, 200)
+                self.assertEqual(gen1.call_args.args[4][2][:3], ["c_123", "r_456", "rc_789"])
+                self.assertEqual(gen1.call_args.args[0], "[Tool result for read]: file-body")
+            finally:
+                server.shutdown()
+                server.server_close()
+                _chat_window.reset()
+
+    def test_large_tool_list_compacts_preserving_parameter_names(self):
+        from gemini_web2api.tools import _compact_tool_defs
+        compacted = _compact_tool_defs([
+            {
+                "name": "read_file",
+                "description": "Line 1\nLine 2",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string", "description": "long"}},
+                    "required": ["filePath"],
+                },
+            }
+        ])
+        self.assertEqual(compacted[0]["name"], "read_file")
+        self.assertEqual(compacted[0]["description"], "Line 1")
+        self.assertEqual(compacted[0]["parameters"], {"filePath": "string*"})
 
     def test_provider_prefixed_model_and_think_variant_sync(self):
         name, mode, think, err, extra = resolve_model("gemini-web/gemini-4-argon@think=0")
