@@ -32,7 +32,6 @@ async function syncCookiesToLocalServer() {
 
     const sig = KEY_COOKIES.map((k) => `${k}=${selected.get(k)?.value || ""}`).join(";");
     if (sig === lastKeySignature) return;
-    lastKeySignature = sig;
 
     const ordered = [];
     const seen = new Set();
@@ -51,29 +50,42 @@ async function syncCookiesToLocalServer() {
       sapisid
     };
 
+    let synced = false;
     for (const url of LOCAL_ENDPOINTS) {
       try {
-        await fetch(url, {
+        const resp = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-Gemini-Cookie-Sync": "1" },
           body: JSON.stringify(payload)
         });
+        if (resp.ok) synced = true;
       } catch {
-        // Local server may not be running; ignore.
+        // Local server may not be running; keep lastKeySignature unset so next alarm retries.
       }
     }
-    await chrome.storage.local.set({ lastCookieRotationAt: Date.now() });
+    if (synced) {
+      lastKeySignature = sig;
+      await chrome.storage.local.set({ lastCookieRotationAt: Date.now() });
+    }
   } catch {
     // Ignore background sync errors.
   }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms?.create?.("gemini-cookie-sync", { periodInMinutes: 1 });
   syncCookiesToLocalServer();
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms?.create?.("gemini-cookie-sync", { periodInMinutes: 1 });
   syncCookiesToLocalServer();
+});
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm?.name === "gemini-cookie-sync") {
+    syncCookiesToLocalServer();
+  }
 });
 
 chrome.cookies.onChanged.addListener((changeInfo) => {

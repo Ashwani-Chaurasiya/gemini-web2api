@@ -218,7 +218,9 @@ def update_cookie_payload(data: dict) -> bool:
             mtime = time.time()
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         log("Updated cookies in memory and on disk via /v1/cookies")
-        return True
+    if not data.get("xsrf_token"):
+        threading.Thread(target=refresh_bl_and_xsrf, daemon=True).start()
+    return True
 
 
 def load_cookie() -> tuple:
