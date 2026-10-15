@@ -177,6 +177,25 @@ def _core_cookie_sig(cookie_str: str) -> tuple:
     return tuple(pairs.get(k, "") for k in ("SID", "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PSIDTS", "__Secure-3PSIDTS", "SAPISID"))
 
 
+def _normalize_model_tickets(raw_tickets) -> dict:
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if (
+            isinstance(mk, str)
+            and isinstance(mv, str)
+            and re.fullmatch(r"gemini-[a-z0-9._-]{1,48}", mk.strip())
+            and re.fullmatch(r"[0-9a-fA-F]{16}", mv.strip())
+        ):
+            k = mk.strip()
+            clean.pop(k, None)
+            clean[k] = mv.strip().lower()
+    if len(clean) > 32:
+        clean = dict(list(clean.items())[-32:])
+    return clean
+
+
 def update_cookie_payload(data: dict) -> bool:
     """Update in-memory and on-disk cookie state from a pushed extension payload."""
     if not isinstance(data, dict) or not data.get("cookie"):
@@ -187,7 +206,16 @@ def update_cookie_payload(data: dict) -> bool:
         if not sapisid and cookie_str:
             m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
             sapisid = m.group(1) if m else ""
-        if _core_cookie_sig(cookie_str) == _core_cookie_sig(_cookie_cache.get("str", "")) and not data.get("xsrf_token") and not data.get("gemini_bl"):
+        same_core_cookies = _core_cookie_sig(cookie_str) == _core_cookie_sig(_cookie_cache.get("str", ""))
+        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+        new_tickets = _normalize_model_tickets(data.get("model_tickets"))
+        tickets_changed = any(cur_tickets.get(k) != v for k, v in new_tickets.items())
+        if (
+            same_core_cookies
+            and not data.get("xsrf_token")
+            and not data.get("gemini_bl")
+            and not tickets_changed
+        ):
             _cookie_cache["str"] = cookie_str
             return True
         if data.get("xsrf_token"):
@@ -196,10 +224,9 @@ def update_cookie_payload(data: dict) -> bool:
             CONFIG["gemini_bl"] = data["gemini_bl"]
         if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
             CONFIG["auth_user"] = str(data["auth_user"])
-        if isinstance(data.get("model_tickets"), dict):
-            tickets = dict(CONFIG.get("model_tickets") or {})
-            tickets.update(data["model_tickets"])
-            CONFIG["model_tickets"] = tickets
+        merged_tickets = _normalize_model_tickets({**cur_tickets, **new_tickets})
+        if merged_tickets:
+            CONFIG["model_tickets"] = merged_tickets
         cf = CONFIG.get("cookie_file")
         if cf:
             try:
@@ -209,7 +236,15 @@ def update_cookie_payload(data: dict) -> bool:
                         raw_existing = rf.read().strip()
                         if raw_existing.startswith("{"):
                             existing = json.loads(raw_existing)
-                existing.update({k: v for k, v in data.items() if v is not None})
+                disk_tickets = _normalize_model_tickets(existing.get("model_tickets"))
+                existing.update({k: v for k, v in data.items() if v is not None and k != "model_tickets"})
+                if disk_tickets or merged_tickets:
+                    combined = dict(disk_tickets)
+                    combined.update(cur_tickets)
+                    combined.update(new_tickets)
+                    merged_tickets = _normalize_model_tickets(combined)
+                    existing["model_tickets"] = merged_tickets
+                    CONFIG["model_tickets"] = dict(merged_tickets)
                 with open(cf, "w", encoding="utf-8") as f:
                     json.dump(existing, f, ensure_ascii=False, indent=2)
                 mtime = os.path.getmtime(cf)
@@ -219,7 +254,7 @@ def update_cookie_payload(data: dict) -> bool:
             mtime = time.time()
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         log("Updated cookies in memory and on disk via /v1/cookies")
-    if not data.get("xsrf_token"):
+    if not data.get("xsrf_token") and (not same_core_cookies or not CONFIG.get("xsrf_token")):
         threading.Thread(target=refresh_bl_and_xsrf, daemon=True).start()
     return True
 
@@ -246,10 +281,11 @@ def load_cookie() -> tuple:
                     CONFIG["gemini_bl"] = data["gemini_bl"]
                 if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
                     CONFIG["auth_user"] = str(data["auth_user"])
-                if isinstance(data.get("model_tickets"), dict):
-                    tickets = dict(CONFIG.get("model_tickets") or {})
-                    tickets.update(data["model_tickets"])
-                    CONFIG["model_tickets"] = tickets
+                disk_tickets = _normalize_model_tickets(data.get("model_tickets"))
+                if disk_tickets:
+                    tickets = dict(disk_tickets)
+                    tickets.update(CONFIG.get("model_tickets") or {})
+                    CONFIG["model_tickets"] = _normalize_model_tickets(tickets)
             elif "\t" in content:
                 cookie_str = _parse_netscape_cookies(content)
                 sapisid = ""

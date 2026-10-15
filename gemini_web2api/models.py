@@ -43,10 +43,24 @@ MODELS = {
 }
 
 
+def _base_model_name(model_name: str) -> str:
+    if not model_name:
+        return ""
+    for suffix in ("-low", "-medium", "-high", "-enhanced"):
+        if model_name.endswith(suffix):
+            return model_name[:-len(suffix)]
+    return model_name
+
+
 def build_model_ticket(cfg: dict, model_name: str = None, variant_override: int = None, model_tickets: dict = None) -> str:
     """Build the X-Goog-Ext-525001261-Jspb header value for StreamGenerate."""
     tickets = model_tickets or {}
-    ticket = (tickets.get(model_name) if model_name else None) or cfg.get("ticket")
+    base_name = _base_model_name(model_name)
+    ticket = (
+        (tickets.get(model_name) if model_name else None)
+        or (tickets.get(base_name) if base_name else None)
+        or cfg.get("ticket")
+    )
     if not ticket:
         return None
     variant = variant_override if variant_override is not None else cfg.get("variant", 1)

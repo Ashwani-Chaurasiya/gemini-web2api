@@ -257,10 +257,21 @@ async function readGeminiPageMetadata(tabs) {
   }
 }
 
+async function readStoredModelTickets() {
+  try {
+    const res = await chrome.storage.local.get("model_tickets");
+    const stored = res?.model_tickets;
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+  } catch {
+    return {};
+  }
+}
+
 async function buildInspection() {
-  const [cookies, tabs] = await Promise.all([
+  const [cookies, tabs, modelTickets] = await Promise.all([
     readGoogleCookies(),
-    chrome.tabs.query({ url: "https://gemini.google.com/*" })
+    chrome.tabs.query({ url: "https://gemini.google.com/*" }),
+    readStoredModelTickets()
   ]);
 
   const selected = selectBestCookies(cookies);
@@ -279,7 +290,8 @@ async function buildInspection() {
     legacyMissing,
     available,
     authUser,
-    pageMetadata
+    pageMetadata,
+    modelTickets
   };
 }
 
@@ -292,8 +304,10 @@ function inspectionMessage(info) {
     legacyMissing,
     available,
     authUser,
-    pageMetadata
+    pageMetadata,
+    modelTickets
   } = info;
+  const ticketKeys = Object.keys(modelTickets || {});
 
   const lines = [
     `Found ${cookies.length} cookie(s) across Google domains.`,
@@ -303,6 +317,7 @@ function inspectionMessage(info) {
     `XSRF / SNlM0e: ${pageMetadata.xsrfToken ? "present" : "missing"}`,
     `gemini_bl / cfb2h: ${pageMetadata.geminiBl ? "present" : "missing"}`,
     `auth_user: ${authUser ?? "default account"}`,
+    `model_tickets: ${ticketKeys.length > 0 ? `${ticketKeys.length} captured (${ticketKeys.join(", ")})` : "none yet (send 1 message in Gemini to capture)"}`,
     `Page data source: ${pageMetadata.source || "unavailable"}`,
     "",
     `Legacy present: ${legacyPresent.join(", ") || "none"}`,
@@ -389,12 +404,14 @@ exportButton.addEventListener("click", async () => {
     }
 
     const cookieString = buildCookieString(info);
+    const ticketKeys = Object.keys(info.modelTickets || {});
     const payload = {
       cookie: cookieString,
       sapisid: info.selected.get("SAPISID").value,
       auth_user: info.authUser,
       xsrf_token: info.pageMetadata.xsrfToken,
-      gemini_bl: info.pageMetadata.geminiBl
+      gemini_bl: info.pageMetadata.geminiBl,
+      ...(ticketKeys.length > 0 ? { model_tickets: info.modelTickets } : {})
     };
 
     const syncRes = await pushToLocalServer(payload);
@@ -412,6 +429,7 @@ exportButton.addEventListener("click", async () => {
       `XSRF: present\n` +
       `gemini_bl: ${info.pageMetadata.geminiBl ? "present" : "not present — current server setting will remain"}\n` +
       `auth_user: ${info.authUser ?? "null"}\n` +
+      `model_tickets: ${ticketKeys.length > 0 ? `${ticketKeys.length} exported` : "none captured yet"}\n` +
       `Local server sync: ${syncLabel}\n\n` +
       "Move the file into gemini-web2api and do not share it or commit it to Git.",
       "ok"

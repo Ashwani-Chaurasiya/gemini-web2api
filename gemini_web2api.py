@@ -110,10 +110,24 @@ MODELS = {
 }
 
 
+def _base_model_name(model_name: str) -> str:
+    if not model_name:
+        return ""
+    for suffix in ("-low", "-medium", "-high", "-enhanced"):
+        if model_name.endswith(suffix):
+            return model_name[:-len(suffix)]
+    return model_name
+
+
 def build_model_ticket(cfg: dict, model_name: str = None, variant_override: int = None, model_tickets: dict = None) -> Optional[str]:
     """Build the X-Goog-Ext-525001261-Jspb header value for StreamGenerate."""
     tickets = model_tickets if model_tickets is not None else (CONFIG.get("model_tickets") or {})
-    ticket = (tickets.get(model_name) if model_name else None) or cfg.get("ticket")
+    base_name = _base_model_name(model_name)
+    ticket = (
+        (tickets.get(model_name) if model_name else None)
+        or (tickets.get(base_name) if base_name else None)
+        or cfg.get("ticket")
+    )
     if not ticket:
         return None
     variant = variant_override if variant_override is not None else cfg.get("variant", 1)
@@ -167,6 +181,25 @@ def _parse_netscape_cookies(raw: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 
+def _normalize_model_tickets(raw_tickets) -> dict:
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if (
+            isinstance(mk, str)
+            and isinstance(mv, str)
+            and re.fullmatch(r"gemini-[a-z0-9._-]{1,48}", mk.strip())
+            and re.fullmatch(r"[0-9a-fA-F]{16}", mv.strip())
+        ):
+            k = mk.strip()
+            clean.pop(k, None)
+            clean[k] = mv.strip().lower()
+    if len(clean) > 32:
+        clean = dict(list(clean.items())[-32:])
+    return clean
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
@@ -188,10 +221,11 @@ def load_cookie() -> tuple:
                 CONFIG["gemini_bl"] = data["gemini_bl"]
             if data.get("auth_user") not in (None, "") and CONFIG.get("auth_user") in (None, ""):
                 CONFIG["auth_user"] = str(data["auth_user"])
-            if isinstance(data.get("model_tickets"), dict):
-                tickets = dict(CONFIG.get("model_tickets") or {})
-                tickets.update(data["model_tickets"])
-                CONFIG["model_tickets"] = tickets
+            disk_tickets = _normalize_model_tickets(data.get("model_tickets"))
+            if disk_tickets:
+                tickets = dict(disk_tickets)
+                tickets.update(CONFIG.get("model_tickets") or {})
+                CONFIG["model_tickets"] = _normalize_model_tickets(tickets)
         elif "\t" in content:
             cookie_str = _parse_netscape_cookies(content)
             sapisid = ""

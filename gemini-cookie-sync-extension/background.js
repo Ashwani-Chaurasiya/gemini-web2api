@@ -42,6 +42,87 @@ const SESSION_COOKIES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const LOCAL_ENDPOINT = "http://127.0.0.1:8081/v1/cookies";
 let debounceTimer = null;
 let lastKeySignature = "";
+let lastCookieSignature = "";
+let cachedTickets = null;
+let ticketWriteQueue = Promise.resolve();
+
+function resolveModelsForMode(mode, variant) {
+  switch (mode) {
+    case 1:
+      return ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"];
+    case 2:
+      return variant === 2
+        ? ["gemini-3.8-flash-thinking"]
+        : ["gemini-3.5-flash-thinking"];
+    case 3:
+      return ["gemini-3.1-pro", "gemini-3.1-pro-enhanced"];
+    case 4:
+      return ["gemini-auto"];
+    case 5:
+      return ["gemini-3.8-flash-thinking-lite", "gemini-3.5-flash-thinking-lite"];
+    case 6:
+      return ["gemini-flash-lite", "gemini-3.5-flash-lite"];
+    case 8:
+      return ["gemini-4-argon"];
+    default:
+      return [];
+  }
+}
+
+function parseTicketHeader(headerVal) {
+  if (!headerVal || typeof headerVal !== "string") return null;
+  try {
+    const arr = JSON.parse(headerVal);
+    if (!Array.isArray(arr) || typeof arr[4] !== "string") return null;
+    const ticket = arr[4].trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(ticket) || !Number.isInteger(arr[14])) return null;
+    const models = resolveModelsForMode(arr[14], arr[15]);
+    if (models.length === 0) return null;
+    return { ticket, models };
+  } catch {
+    return null;
+  }
+}
+
+async function getStoredModelTickets() {
+  if (cachedTickets) return { ...cachedTickets };
+  try {
+    const res = await chrome.storage.local.get("model_tickets");
+    const stored = res?.model_tickets;
+    cachedTickets = stored && typeof stored === "object" && !Array.isArray(stored) ? { ...stored } : {};
+  } catch {
+    cachedTickets = {};
+  }
+  return { ...cachedTickets };
+}
+
+function scheduleCookieSync(force = false) {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    void syncCookiesToLocalServer(force);
+  }, 2000);
+}
+
+function recordCapturedTicket(headerVal) {
+  const parsed = parseTicketHeader(headerVal);
+  if (!parsed) return;
+  ticketWriteQueue = ticketWriteQueue
+    .then(async () => {
+      const current = await getStoredModelTickets();
+      let changed = false;
+      for (const m of parsed.models) {
+        if (current[m] !== parsed.ticket) {
+          current[m] = parsed.ticket;
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      await chrome.storage.local.set({ model_tickets: current });
+      cachedTickets = current;
+      scheduleCookieSync(false);
+    })
+    .catch(() => {});
+}
 
 function normalizeDomain(domain = "") {
   return domain.replace(/^\./, "").toLowerCase();
@@ -108,7 +189,10 @@ async function fetchGeminiPageMeta() {
 async function syncCookiesToLocalServer(force = false) {
   try {
     const meta = force ? await fetchGeminiPageMeta() : {};
-    const allCookies = await chrome.cookies.getAll({ domain: "google.com" });
+    const [allCookies, modelTickets] = await Promise.all([
+      chrome.cookies.getAll({ domain: "google.com" }),
+      getStoredModelTickets()
+    ]);
     const googleCookies = allCookies.filter((c) => isGoogleCookie(c) && Boolean(c.value));
     const selected = new Map();
 
@@ -125,10 +209,19 @@ async function syncCookiesToLocalServer(force = false) {
     const hasSession = SESSION_COOKIES.some((name) => selected.has(name));
     if (!sapisid || !hasSession) return false;
 
-    const sig = KEY_COOKIES.map((k) => `${k}=${selected.get(k)?.value || ""}`).join(";");
+    const cookieSig = KEY_COOKIES.map((k) => `${k}=${selected.get(k)?.value || ""}`).join(";");
+    const ticketKeys = Object.keys(modelTickets).sort();
+    const ticketSig = ticketKeys.map((k) => `${k}:${modelTickets[k]}`).join(",");
+    const sig = `${cookieSig}|t=${ticketSig}`;
     if (!force && sig === lastKeySignature) return true;
 
-    const refreshedMeta = meta.xsrf_token ? meta : await fetchGeminiPageMeta();
+    const cookiesChanged = cookieSig !== lastCookieSignature;
+    const refreshedMeta = meta.xsrf_token
+      ? meta
+      : (force || cookiesChanged)
+        ? await fetchGeminiPageMeta()
+        : {};
+
     const cookieString = EXPORT_ORDER
       .filter((name) => selected.has(name))
       .map((name) => `${name}=${selected.get(name).value}`)
@@ -137,10 +230,12 @@ async function syncCookiesToLocalServer(force = false) {
     const payload = { cookie: cookieString };
     if (refreshedMeta.xsrf_token) payload.xsrf_token = refreshedMeta.xsrf_token;
     if (refreshedMeta.gemini_bl) payload.gemini_bl = refreshedMeta.gemini_bl;
+    if (ticketKeys.length > 0) payload.model_tickets = modelTickets;
 
     const res = await postPayloadToServer(payload);
     if (res.ok) {
       lastKeySignature = sig;
+      lastCookieSignature = cookieSig;
       return true;
     }
   } catch {
@@ -173,12 +268,24 @@ chrome.cookies.onChanged.addListener((changeInfo) => {
   if (changeInfo.removed) return;
   const { cookie } = changeInfo;
   if (!cookie || !isGoogleCookie(cookie) || !KEY_COOKIES.includes(cookie.name)) return;
-
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => {
-    void syncCookiesToLocalServer(false);
-  }, 2000);
+  scheduleCookieSync(false);
 });
+
+if (chrome.webRequest?.onBeforeSendHeaders) {
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    (details) => {
+      const headers = details?.requestHeaders || [];
+      for (const h of headers) {
+        if (h?.name && h.name.toLowerCase() === "x-goog-ext-525001261-jspb" && h.value) {
+          recordCapturedTicket(h.value);
+          break;
+        }
+      }
+    },
+    { urls: ["https://gemini.google.com/*StreamGenerate*"] },
+    ["requestHeaders"]
+  );
+}
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "sync-cookies" && msg.payload) {

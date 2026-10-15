@@ -605,6 +605,60 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
         self.assertEqual((name, mode, think), ("gemini-4-argon", 8, 0))
         self.assertEqual(json.loads(extra["_ticket"])[15], 2)
 
+        with mock.patch.dict(CONFIG, {"model_tickets": {"gemini-4-argon": "1122334455667788"}}):
+            _, _, _, _, extra_high = resolve_model("gemini-4-argon-high")
+            self.assertEqual(json.loads(extra_high["_ticket"])[4], "1122334455667788")
+
+    def test_cookie_payload_merges_validated_model_tickets_even_when_cookies_unchanged(self):
+        import os
+        import tempfile
+        from gemini_web2api.gemini import _cookie_cache, update_cookie_payload
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+            json.dump(
+                {
+                    "cookie": "SID=s1; SAPISID=sap1",
+                    "sapisid": "sap1",
+                    "xsrf_token": "xsrf_1",
+                    "model_tickets": {"gemini-3.1-pro": "e6fa609c3fa255c0"},
+                },
+                tf,
+            )
+            temp_path = tf.name
+        try:
+            with mock.patch.dict(CONFIG, {"cookie_file": temp_path, "model_tickets": {}}), \
+                 mock.patch("gemini_web2api.gemini.refresh_bl_and_xsrf", return_value=False):
+                _cookie_cache.update({"str": "SID=s1; SAPISID=sap1", "sapisid": "sap1", "mtime": 0})
+                ok = update_cookie_payload({
+                    "cookie": "SID=s1; SAPISID=sap1",
+                    "model_tickets": {
+                        "gemini-4-argon": "95A4C0ABCBA24364",
+                        "invalid_key": "95a4c0abcba24364",
+                        "gemini-auto": "bad-hex",
+                    },
+                })
+                self.assertTrue(ok)
+                self.assertEqual(
+                    CONFIG["model_tickets"],
+                    {
+                        "gemini-3.1-pro": "e6fa609c3fa255c0",
+                        "gemini-4-argon": "95a4c0abcba24364",
+                    },
+                )
+                with open(temp_path, "r", encoding="utf-8") as rf:
+                    saved = json.load(rf)
+                self.assertEqual(
+                    saved["model_tickets"],
+                    {
+                        "gemini-3.1-pro": "e6fa609c3fa255c0",
+                        "gemini-4-argon": "95a4c0abcba24364",
+                    },
+                )
+        finally:
+            _cookie_cache.update({"str": "", "sapisid": None, "mtime": 0})
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     def test_parse_tool_calls_supports_multiple_formats_and_filters_unknown_json(self):
         clean, calls = parse_tool_calls(
             'Hello\n```json\n{"name": "bash", "args": {"command": "ls"}}\n```',
