@@ -171,6 +171,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "ticket_timeout_sec": 25,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -185,9 +186,9 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
 不会将对话保存在账号历史记录中。
 
-**模型 Ticket 与账号权限回退 (`send_model_ticket` / `model_tickets`)**:
+**模型 Ticket 与账号权限回退 (`send_model_ticket` / `model_tickets` / `ticket_timeout_sec`)**:
 - `send_model_ticket` (默认 `true`) 会发送 `X-Goog-Ext-525001261-Jspb` 请求头以路由至 `gemini-4-argon`、`gemini-3.1-pro`、`gemini-3.8-flash` 或 `gemini-flash-lite`。
-- 如果当前账号无目标模型权限或上游对该 Ticket 返回预设错误 / `BardErrorInfo`，服务会自动记录警告并移除该请求头重试一次，回退至账号默认模型返回结果。
+- 如果当前账号无目标模型权限，或上游对该 Ticket 返回预设错误 / `BardErrorInfo` / 超过 `ticket_timeout_sec`（默认 `25` 秒）未返回有效文本，服务会自动记录警告并移除该请求头重试一次，回退至账号默认模型返回结果。
 - 如需自定义抓包获取的 16 位十六进制 Ticket（浏览器 DevTools `StreamGenerate` 请求头 `X-Goog-Ext-525001261-Jspb` 数组的第 5 项 `[4]`），可在 `config.json` 中配置 `"model_tickets": {"gemini-4-argon": "<16位hex>"}`（基础模型名配置会自动作用于 `-low`/`-medium`/`-high` 变体）。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.

@@ -181,6 +181,7 @@ Create `config.json` in the same directory:
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "ticket_timeout_sec": 25,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -195,9 +196,9 @@ Create `config.json` in the same directory:
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
 
-**Model Tickets & Account Entitlements (`send_model_ticket` / `model_tickets`)**:
+**Model Tickets & Account Entitlements (`send_model_ticket` / `model_tickets` / `ticket_timeout_sec`)**:
 - `send_model_ticket` (default `true`) sends the `X-Goog-Ext-525001261-Jspb` model ticket header so Gemini Web routes to `gemini-4-argon`, `gemini-3.1-pro`, `gemini-3.8-flash`, or `gemini-flash-lite`.
-- If an account is not entitled to a requested model tier (or a ticket is rejected upstream with a canned error / `BardErrorInfo`), `gemini-web2api` automatically logs a warning and retries once without the ticket header so the account's default model answers instead of failing.
+- If an account is not entitled to a requested model tier (or a ticket is rejected upstream with a canned error, `BardErrorInfo`, or hangs past `ticket_timeout_sec` [default `25` seconds] before emitting text), `gemini-web2api` automatically logs a warning and retries once without the ticket header so the account's default model answers instead of failing.
 - If Google rotates a model ticket for your account, copy element `[4]` (the 16-char hex ID) from `X-Goog-Ext-525001261-Jspb` in your browser DevTools `StreamGenerate` request and set `"model_tickets": {"gemini-4-argon": "<16-hex-ticket>"}` in `config.json` (base-name overrides also apply to `-low`/`-medium`/`-high` variants).
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.

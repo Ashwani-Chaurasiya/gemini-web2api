@@ -358,6 +358,28 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
+    @mock.patch("gemini_web2api.server.generate_stream", side_effect=RuntimeError("stream init failed"))
+    def test_stream_endpoints_return_502_when_initial_prime_fails(self, _generate_stream):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-4-argon",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        self.assertEqual(status, 502)
+        self.assertIn("stream init failed", json.loads(body)["error"]["message"])
+
+        status2, _, body2 = self.post_json(
+            "/v1beta/models/gemini-4-argon:streamGenerateContent",
+            {
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            },
+        )
+        self.assertEqual(status2, 502)
+        self.assertIn("stream init failed", json.loads(body2)["error"]["message"])
+
     @mock.patch("gemini_web2api.server.generate", return_value="hello")
     def test_responses_text_stream_has_complete_event_sequence(self, _generate):
         status, headers, body = self.post_json(
@@ -658,7 +680,7 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
                     yield ln
 
         class FakeClient:
-            def stream(self, method, url, content=None, headers=None):
+            def stream(self, method, url, content=None, headers=None, timeout=None):
                 stream_headers.append(dict(headers or {}))
                 if len(stream_headers) == 1:
                     return FakeStreamResp([
@@ -678,6 +700,141 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
         self.assertEqual(len(stream_headers), 2)
         self.assertIn("X-Goog-Ext-525001261-Jspb", stream_headers[0])
         self.assertNotIn("X-Goog-Ext-525001261-Jspb", stream_headers[1])
+
+    def test_ticket_timeout_falls_back_without_header_in_modular_and_standalone(self):
+        import socket
+        import urllib.error
+        from gemini_web2api.gemini import generate, generate_stream
+
+        def make_frame(msg: str) -> bytes:
+            inner = json.dumps([None, None, None, None, [["rc_1", [msg]]]])
+            line = json.dumps([["wrb.fr", None, inner + (" " * 220)]]) + "\n"
+            return line.encode("utf-8")
+
+        class FakeResp:
+            def __init__(self, payload: bytes):
+                self._payload = payload
+
+            def read(self):
+                return self._payload
+
+        seen_calls = []
+
+        def fake_urlopen(req, context=None, timeout=None):
+            seen_calls.append((dict(req.headers), timeout))
+            if len(seen_calls) == 1:
+                raise urllib.error.URLError(socket.timeout("timed out"))
+            return FakeResp(make_frame("fallback after timeout"))
+
+        _, mode, think, _, extra = resolve_model("gemini-4-argon")
+        with mock.patch.dict(CONFIG, {"retry_attempts": 1, "request_timeout_sec": 180, "ticket_timeout_sec": 25}), \
+             mock.patch("gemini_web2api.gemini.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = generate("hello", mode, think, None, extra)
+        self.assertEqual(out, "fallback after timeout")
+        self.assertEqual(len(seen_calls), 2)
+        self.assertTrue(any(k.lower() == "x-goog-ext-525001261-jspb" for k in seen_calls[0][0]))
+        self.assertEqual(seen_calls[0][1], 25.0)
+        self.assertFalse(any(k.lower() == "x-goog-ext-525001261-jspb" for k in seen_calls[1][0]))
+        self.assertEqual(seen_calls[1][1], 180)
+
+        # Standalone non-streaming parity + 2-request termination bound
+        seen_calls.clear()
+        with mock.patch.dict(single_file.CONFIG, {"retry_attempts": 1, "request_timeout_sec": 180, "ticket_timeout_sec": 25}), \
+             mock.patch.object(single_file.urllib.request, "urlopen", side_effect=fake_urlopen):
+            raw_out = single_file.gemini_stream_generate("hello", mode, think, None, extra)
+            self.assertEqual(single_file.extract_response_text(raw_out), "fallback after timeout")
+        self.assertEqual(len(seen_calls), 2)
+        self.assertTrue(any(k.lower() == "x-goog-ext-525001261-jspb" for k in seen_calls[0][0]))
+        self.assertEqual(seen_calls[0][1], 25.0)
+        self.assertFalse(any(k.lower() == "x-goog-ext-525001261-jspb" for k in seen_calls[1][0]))
+        self.assertEqual(seen_calls[1][1], 180)
+
+        # Streaming ticket timeout after initial metadata-only wrb.fr frame falls back cleanly
+        stream_calls = []
+        meta_frame = json.dumps([["wrb.fr", None, '[null,["c_1","r_1"],{"18":"r_1"}]']]) + "\n"
+
+        class TimeoutStreamResp:
+            status_code = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_text(self):
+                yield meta_frame
+                raise socket.timeout("read timed out")
+
+        class OkStreamResp:
+            status_code = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_text(self):
+                yield make_frame("stream fallback ok").decode()
+
+        class TimeoutThenOkClient:
+            def stream(self, method, url, content=None, headers=None, timeout=None):
+                stream_calls.append((dict(headers or {}), timeout))
+                if len(stream_calls) == 1:
+                    return TimeoutStreamResp()
+                return OkStreamResp()
+
+        with mock.patch.dict(CONFIG, {"retry_attempts": 1, "request_timeout_sec": 180, "ticket_timeout_sec": 25}), \
+             mock.patch("gemini_web2api.gemini.HAS_HTTPX", True), \
+             mock.patch("gemini_web2api.gemini._get_httpx_client", return_value=TimeoutThenOkClient()):
+            chunks = list(generate_stream("hello", mode, think, None, extra))
+        self.assertEqual("".join(chunks), "stream fallback ok")
+        self.assertEqual(len(stream_calls), 2)
+        self.assertIn("X-Goog-Ext-525001261-Jspb", stream_calls[0][0])
+        self.assertEqual(stream_calls[0][1], 25.0)
+        self.assertNotIn("X-Goog-Ext-525001261-Jspb", stream_calls[1][0])
+        self.assertEqual(stream_calls[1][1], 180)
+
+        # Mid-stream timeout AFTER emitting text must raise immediately without retrying or duplicating output
+        mid_stream_calls = []
+
+        class MidStreamTimeoutResp:
+            status_code = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_text(self):
+                yield make_frame("x" * 305).decode()
+                raise socket.timeout("mid-stream timeout")
+
+        class MidStreamClient:
+            def stream(self, method, url, content=None, headers=None, timeout=None):
+                mid_stream_calls.append(dict(headers or {}))
+                return MidStreamTimeoutResp()
+
+        emitted = []
+        with mock.patch.dict(CONFIG, {"retry_attempts": 3, "retry_delay_sec": 0}), \
+             mock.patch("gemini_web2api.gemini.HAS_HTTPX", True), \
+             mock.patch("gemini_web2api.gemini._get_httpx_client", return_value=MidStreamClient()):
+            with self.assertRaises(socket.timeout):
+                for ch in generate_stream("hello", mode, think, None, extra):
+                    emitted.append(ch)
+        self.assertEqual(len(mid_stream_calls), 1)
+        self.assertEqual(emitted, ["x" * 305])
 
 
 if __name__ == "__main__":

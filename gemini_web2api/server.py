@@ -219,6 +219,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and (not tools or tool_choice == "none"):
             try:
+                stream_iter = iter(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields))
+                first_delta = next(stream_iter, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+            try:
                 self._start_sse()
                 first_chunk = {
                     "id": cid,
@@ -233,7 +239,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                if first_delta:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -247,6 +258,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:
@@ -539,9 +553,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not has_tools:
             try:
+                stream_iter = iter(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields))
+                first_delta = next(stream_iter, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+            try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in ([first_delta] if first_delta else []):
+                    full_text += delta
+                    chunk_obj = {
+                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                        "modelVersion": model_name,
+                    }
+                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta in stream_iter:
                     if not delta:
                         continue
                     full_text += delta
@@ -566,6 +594,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:

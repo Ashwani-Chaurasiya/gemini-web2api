@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import ssl
+import socket
 import os
 import hashlib
 import threading
@@ -15,6 +16,7 @@ try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 from .config import CONFIG
@@ -132,7 +134,7 @@ def _build_headers(extra_fields: dict = None) -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    if extra_fields and "_ticket" in extra_fields:
+    if extra_fields and "_ticket" in extra_fields and CONFIG.get("send_model_ticket", True):
         headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -299,6 +301,27 @@ def _strip_ticket(extra_fields: dict) -> dict:
     return {k: v for k, v in extra_fields.items() if k != "_ticket"}
 
 
+def _ticket_timeout() -> float:
+    req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    raw_tt = CONFIG.get("ticket_timeout_sec")
+    tt = float(raw_tt) if raw_tt is not None and float(raw_tt) > 0 else 25.0
+    return max(1.0, min(req_t, tt))
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    if isinstance(err, urllib.error.HTTPError):
+        return False
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.HTTPStatusError):
+        return False
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):
+        return True
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.TimeoutException):
+        return True
+    return "timed out" in str(err).lower() or "timeout" in type(err).__name__.lower()
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
@@ -326,6 +349,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
         url = _get_url()
         headers = _build_headers(extra_fields)
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -333,12 +358,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=req_timeout)
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+                resp = urllib.request.urlopen(req, context=ctx, timeout=req_timeout)
             raw = resp.read().decode("utf-8", errors="replace")
             text = extract_response_text(raw)
-            if extra_fields and extra_fields.get("_ticket") and _is_canned_error(text):
+            if has_ticket and _is_canned_error(text):
                 extra_fields = _strip_ticket(extra_fields)
                 log("Model ticket returned canned error; falling back without X-Goog-Ext-525001261-Jspb header")
                 continue
@@ -354,9 +379,9 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
-            if isinstance(e, RuntimeError) and "BardErrorInfo" in str(e) and extra_fields and extra_fields.get("_ticket"):
+            if has_ticket and (_is_timeout_error(e) or (isinstance(e, RuntimeError) and "BardErrorInfo" in str(e))):
                 extra_fields = _strip_ticket(extra_fields)
-                log(f"Model ticket rejected ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                log(f"Model ticket rejected or timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
                 continue
             last_err = e
             attempt += 1
@@ -380,17 +405,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    yielded_any = False
     attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
     attempt = 0
     while attempt < attempts:
         body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
         url = _get_url()
         headers = _build_headers(extra_fields)
-        has_ticket = bool(extra_fields and extra_fields.get("_ticket"))
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
         pending = None
         try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                if resp.status_code in (400, 405) and not refreshed and not emitted_raw_text:
+            with client.stream("POST", url, content=body, headers=headers, timeout=req_timeout) as resp:
+                if resp.status_code in (400, 405) and not refreshed and not yielded_any:
                     refreshed = True
                     if refresh_bl_and_xsrf():
                         log(f"Stream HTTP {resp.status_code}: refreshed BL/XSRF, retrying immediately...")
@@ -402,7 +429,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
-                            if not emitted_raw_text and has_ticket:
+                            if not yielded_any and has_ticket:
                                 raise _TicketRejectedError(f"BardErrorInfo [{bard_err.group(1)}]")
                             raise RuntimeError(
                                 f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
@@ -414,7 +441,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 continue
                             if not t.startswith(emitted_raw_text):
                                 raise RuntimeError("Gemini stream content changed during retry")
-                            if has_ticket and not emitted_raw_text:
+                            if has_ticket and not yielded_any:
                                 if len(t) <= 300:
                                     pending = t
                                     continue
@@ -422,6 +449,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             delta = clean_text(t[len(emitted_raw_text):], strip=False)
                             emitted_raw_text = t
                             if delta:
+                                yielded_any = True
                                 yield delta
                 if pending is not None:
                     if _is_canned_error(clean_text(pending)):
@@ -429,6 +457,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     delta = clean_text(pending, strip=False)
                     emitted_raw_text = pending
                     if delta:
+                        yielded_any = True
                         yield delta
             return
         except _TicketRejectedError as e:
@@ -436,6 +465,12 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             log(f"Stream model ticket rejected ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
             continue
         except Exception as e:
+            if not yielded_any and has_ticket and _is_timeout_error(e):
+                extra_fields = _strip_ticket(extra_fields)
+                log(f"Stream model ticket timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                continue
+            if yielded_any:
+                raise
             last_err = e
             attempt += 1
             if attempt < attempts:

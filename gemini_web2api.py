@@ -25,6 +25,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import ssl
+import socket
 import time
 import uuid
 import re
@@ -36,13 +37,12 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Optional
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 
 try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 __version__ = "1.1.0"
@@ -55,6 +55,7 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
+    "ticket_timeout_sec": 25,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
@@ -407,13 +408,15 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         }
         if prefix:
             headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-        if extra_fields and "_ticket" in extra_fields:
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        if has_ticket:
             headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
         cookie_str, sapisid = load_cookie()
         if cookie_str:
             headers["Cookie"] = cookie_str
         if sapisid:
             headers["Authorization"] = make_sapisidhash(sapisid)
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             ctx = ssl.create_default_context()
@@ -423,10 +426,17 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=req_timeout)
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+                resp = urllib.request.urlopen(req, context=ctx, timeout=req_timeout)
+            raw = resp.read().decode("utf-8", errors="replace")
+            if has_ticket:
+                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+                if bard_err or _is_canned_error(extract_response_text(raw)):
+                    extra_fields = _strip_ticket(extra_fields)
+                    log("Model ticket rejected upstream; falling back without X-Goog-Ext-525001261-Jspb header")
+                    continue
+            return raw
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (400, 405) and not refreshed and update_bl_if_needed():
@@ -438,6 +448,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            if has_ticket and _is_timeout_error(e):
+                extra_fields = _strip_ticket(extra_fields)
+                log(f"Model ticket timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                continue
             last_err = e
             attempt += 1
             if attempt < attempts:
@@ -497,7 +511,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     }
     if prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    if extra_fields and "_ticket" in extra_fields:
+    has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+    if has_ticket:
         headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     cookie_str, sapisid = load_cookie()
     if cookie_str:
@@ -516,11 +531,12 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         return
 
     prev_text = ""
-    has_ticket = bool(extra_fields and extra_fields.get("_ticket"))
+    yielded_any = False
     pending = None
     ticket_rejected = None
+    req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+    with httpx.Client(transport=transport, timeout=req_timeout, verify=True) as client:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -530,7 +546,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     if "BardErrorInfo" in buf:
                         m = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if m:
-                            if not prev_text and has_ticket:
+                            if not yielded_any and has_ticket:
                                 raise _TicketRejectedError(f"BardErrorInfo [{m.group(1)}]")
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
@@ -547,8 +563,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                 for part in inner2[4]:
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                         for t in part[1]:
-                                            if isinstance(t, str) and len(t) > len(prev_text):
-                                                if has_ticket and not prev_text:
+                                             if isinstance(t, str) and len(t) > len(prev_text):
+                                                if has_ticket and not yielded_any:
                                                     if len(t) <= 300:
                                                         pending = t
                                                         continue
@@ -556,6 +572,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                                 delta = t[len(prev_text):]
                                                 delta = clean_gemini_text(delta, strip=False)
                                                 if delta:
+                                                    yielded_any = True
                                                     yield delta
                                                 prev_text = t
                         except (json.JSONDecodeError, IndexError, TypeError):
@@ -566,10 +583,13 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     delta = clean_gemini_text(pending, strip=False)
                     prev_text = pending
                     if delta:
+                        yielded_any = True
                         yield delta
         except _TicketRejectedError as e:
             ticket_rejected = str(e)
         except Exception as e:
+            if yielded_any:
+                raise
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) in (400, 405):
                 if update_bl_if_needed():
                     log("BL/XSRF updated, falling back to non-streaming for this request")
@@ -578,7 +598,11 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     if text:
                         yield text
                     return
-            raise
+                raise
+            if has_ticket and _is_timeout_error(e):
+                ticket_rejected = f"timeout: {e}"
+            else:
+                raise
 
     if ticket_rejected:
         log(f"Stream model ticket rejected ({ticket_rejected}); falling back without X-Goog-Ext-525001261-Jspb header")
@@ -625,6 +649,27 @@ def _strip_ticket(extra_fields: dict) -> dict:
     if not extra_fields or not extra_fields.get("_ticket"):
         return extra_fields
     return {k: v for k, v in extra_fields.items() if k != "_ticket"}
+
+
+def _ticket_timeout() -> float:
+    req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    raw_tt = CONFIG.get("ticket_timeout_sec")
+    tt = float(raw_tt) if raw_tt is not None and float(raw_tt) > 0 else 25.0
+    return max(1.0, min(req_t, tt))
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    if isinstance(err, urllib.error.HTTPError):
+        return False
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.HTTPStatusError):
+        return False
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):
+        return True
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.TimeoutException):
+        return True
+    return "timed out" in str(err).lower() or "timeout" in type(err).__name__.lower()
 
 
 def extract_response_text(raw: str) -> str:
@@ -978,19 +1023,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None, extra
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, extra_fields=None):
-        has_ticket = bool(extra_fields and extra_fields.get("_ticket"))
-        try:
-            raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
-            text = extract_response_text(raw)
-            rejected = "canned error" if (has_ticket and _is_canned_error(text)) else None
-        except RuntimeError as e:
-            if not (has_ticket and "BardErrorInfo" in str(e)):
-                raise
-            rejected = str(e)
-        if rejected:
-            log(f"Model ticket rejected ({rejected}); falling back without X-Goog-Ext-525001261-Jspb header")
-            raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, _strip_ticket(extra_fields))
-            text = extract_response_text(raw)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
@@ -1021,6 +1055,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and not tools:
+            try:
+                stream_iter = iter(gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra))
+                first_delta = next(stream_iter, None)
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
             # True streaming: forward chunks as they arrive
             try:
                 self.send_response(200)
@@ -1031,7 +1071,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra):
+                if first_delta:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta_text in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -1046,6 +1091,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         # Non-streaming (or tool calling which needs full response)
