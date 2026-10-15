@@ -134,7 +134,7 @@ def _build_headers(extra_fields: dict = None) -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    if extra_fields and "_ticket" in extra_fields and CONFIG.get("send_model_ticket", True):
+    if extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True):
         headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -302,17 +302,28 @@ def _strip_ticket(extra_fields: dict) -> dict:
 
 
 def _ticket_timeout() -> float:
-    req_t = float(CONFIG.get("request_timeout_sec") or 180)
-    raw_tt = CONFIG.get("ticket_timeout_sec")
-    tt = float(raw_tt) if raw_tt is not None and float(raw_tt) > 0 else 25.0
+    try:
+        req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    except (ValueError, TypeError):
+        req_t = 180.0
+    raw_tt = CONFIG.get("ticket_timeout_sec", 25)
+    if raw_tt is None:
+        return max(1.0, min(req_t, 25.0))
+    try:
+        tt = float(raw_tt)
+    except (ValueError, TypeError):
+        tt = 25.0
+    if tt <= 0:
+        return max(1.0, req_t)
     return max(1.0, min(req_t, tt))
 
 
 def _is_timeout_error(err: BaseException) -> bool:
     if isinstance(err, urllib.error.HTTPError):
         return False
-    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.HTTPStatusError):
-        return False
+    if HAS_HTTPX and httpx is not None:
+        if isinstance(err, (httpx.HTTPStatusError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return False
     if isinstance(err, (TimeoutError, socket.timeout)):
         return True
     if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):

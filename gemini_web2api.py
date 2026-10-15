@@ -563,7 +563,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                 for part in inner2[4]:
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                         for t in part[1]:
-                                             if isinstance(t, str) and len(t) > len(prev_text):
+                                            if isinstance(t, str) and len(t) > len(prev_text):
                                                 if has_ticket and not yielded_any:
                                                     if len(t) <= 300:
                                                         pending = t
@@ -652,17 +652,28 @@ def _strip_ticket(extra_fields: dict) -> dict:
 
 
 def _ticket_timeout() -> float:
-    req_t = float(CONFIG.get("request_timeout_sec") or 180)
-    raw_tt = CONFIG.get("ticket_timeout_sec")
-    tt = float(raw_tt) if raw_tt is not None and float(raw_tt) > 0 else 25.0
+    try:
+        req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    except (ValueError, TypeError):
+        req_t = 180.0
+    raw_tt = CONFIG.get("ticket_timeout_sec", 25)
+    if raw_tt is None:
+        return max(1.0, min(req_t, 25.0))
+    try:
+        tt = float(raw_tt)
+    except (ValueError, TypeError):
+        tt = 25.0
+    if tt <= 0:
+        return max(1.0, req_t)
     return max(1.0, min(req_t, tt))
 
 
 def _is_timeout_error(err: BaseException) -> bool:
     if isinstance(err, urllib.error.HTTPError):
         return False
-    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.HTTPStatusError):
-        return False
+    if HAS_HTTPX and httpx is not None:
+        if isinstance(err, (httpx.HTTPStatusError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return False
     if isinstance(err, (TimeoutError, socket.timeout)):
         return True
     if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):
@@ -1055,13 +1066,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and not tools:
-            try:
-                stream_iter = iter(gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra))
-                first_delta = next(stream_iter, None)
-            except Exception as e:
-                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-                return
             # True streaming: forward chunks as they arrive
+            stream_iter = gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra)
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -1071,11 +1077,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                if first_delta:
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
                 for delta_text in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}

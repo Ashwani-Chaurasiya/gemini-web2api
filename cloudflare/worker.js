@@ -1293,6 +1293,11 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config, extraFie
         signal: controller.signal,  // 关联中止信号
       });
 
+      // 非 Ticket 请求连接建立后即清除连接超时，避免截断超过 28 秒的长响应体
+      if (!hasTicket) {
+        clearTimeout(timeout);
+      }
+
       // ============================================================
       // 错误状态码处理
       // ============================================================
@@ -2330,6 +2335,9 @@ async function handleChatCompletions(request, body, config) {
                 body: reqBody,
                 signal: fetchController.signal,
               });
+              if (!hasTicket) {
+                clearTimeout(fetchTimeout);
+              }
 
               // 检查响应状态码
               if (!response.ok) {
@@ -2398,10 +2406,6 @@ async function handleChatCompletions(request, body, config) {
                             if (typeof t === 'string' && t.length > prevText.length) {
                               if (!switchedToFullTimeout) {
                                 clearTimeout(fetchTimeout);
-                                fetchTimeout = setTimeout(function () {
-                                  timedOutByTimer = true;
-                                  fetchController.abort();
-                                }, fullStreamTimeoutSec * 1000);
                                 switchedToFullTimeout = true;
                               }
                               if (hasTicket && !yieldedAny) {

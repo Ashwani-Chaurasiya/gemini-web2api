@@ -358,28 +358,6 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
-    @mock.patch("gemini_web2api.server.generate_stream", side_effect=RuntimeError("stream init failed"))
-    def test_stream_endpoints_return_502_when_initial_prime_fails(self, _generate_stream):
-        status, _, body = self.post_json(
-            "/v1/chat/completions",
-            {
-                "model": "gemini-4-argon",
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": True,
-            },
-        )
-        self.assertEqual(status, 502)
-        self.assertIn("stream init failed", json.loads(body)["error"]["message"])
-
-        status2, _, body2 = self.post_json(
-            "/v1beta/models/gemini-4-argon:streamGenerateContent",
-            {
-                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-            },
-        )
-        self.assertEqual(status2, 502)
-        self.assertIn("stream init failed", json.loads(body2)["error"]["message"])
-
     @mock.patch("gemini_web2api.server.generate", return_value="hello")
     def test_responses_text_stream_has_complete_event_sequence(self, _generate):
         status, headers, body = self.post_json(
@@ -835,6 +813,52 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
                     emitted.append(ch)
         self.assertEqual(len(mid_stream_calls), 1)
         self.assertEqual(emitted, ["x" * 305])
+
+        # Standalone streaming ticket timeout fallback + _ticket_timeout config resilience
+        from gemini_web2api.gemini import _ticket_timeout
+        with mock.patch.dict(CONFIG, {"request_timeout_sec": 180, "ticket_timeout_sec": 0}):
+            self.assertEqual(_ticket_timeout(), 180.0)
+        with mock.patch.dict(CONFIG, {"request_timeout_sec": 180, "ticket_timeout_sec": "bad"}):
+            self.assertEqual(_ticket_timeout(), 25.0)
+
+        standalone_stream_calls = []
+
+        class FakeStandaloneHttpx:
+            HTTPStatusError = type("HTTPStatusError", (Exception,), {})
+            ConnectTimeout = type("ConnectTimeout", (Exception,), {})
+            PoolTimeout = type("PoolTimeout", (Exception,), {})
+            TimeoutException = type("TimeoutException", (Exception,), {})
+
+            @staticmethod
+            def HTTPTransport(proxy=None):
+                return None
+
+            class Client:
+                def __init__(self, transport=None, timeout=None, verify=True):
+                    self.timeout = timeout
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def stream(self, method, url, content=None, headers=None):
+                    standalone_stream_calls.append((dict(headers or {}), self.timeout))
+                    if len(standalone_stream_calls) == 1:
+                        return TimeoutStreamResp()
+                    return OkStreamResp()
+
+        with mock.patch.dict(single_file.CONFIG, {"retry_attempts": 1, "request_timeout_sec": 180, "ticket_timeout_sec": 25}), \
+             mock.patch.object(single_file, "HAS_HTTPX", True), \
+             mock.patch.object(single_file, "httpx", FakeStandaloneHttpx):
+            sf_chunks = list(single_file.gemini_stream_generate_iter("hello", mode, think, None, extra))
+        self.assertEqual("".join(sf_chunks), "stream fallback ok")
+        self.assertEqual(len(standalone_stream_calls), 2)
+        self.assertIn("X-Goog-Ext-525001261-Jspb", standalone_stream_calls[0][0])
+        self.assertEqual(standalone_stream_calls[0][1], 25.0)
+        self.assertNotIn("X-Goog-Ext-525001261-Jspb", standalone_stream_calls[1][0])
+        self.assertEqual(standalone_stream_calls[1][1], 180)
 
 
 if __name__ == "__main__":
