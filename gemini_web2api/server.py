@@ -169,20 +169,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+            _visible = ("gemini-4-argon", "gemini-3.8-flash", "gemini-3.5-flash-lite")
             if self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
-                     "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                     "owned_by": "google", "description": MODELS[n]["desc"]}
+                    for n in _visible if n in MODELS
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self.send_json({"models": [
-                    {"name": f"models/{n}", "displayName": n, "description": c["desc"],
+                    {"name": f"models/{n}", "displayName": n, "description": MODELS[n]["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n in _visible if n in MODELS
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__, "models": [n for n in _visible if n in MODELS]})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
