@@ -349,6 +349,15 @@ async function downloadJson(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
+async function pushToLocalServer(payload) {
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "sync-cookies", payload });
+    return res || { ok: false, status: 0 };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
 openButton.addEventListener("click", async () => {
   await chrome.tabs.create({ url: "https://gemini.google.com/app" });
 });
@@ -388,25 +397,22 @@ exportButton.addEventListener("click", async () => {
       gemini_bl: info.pageMetadata.geminiBl
     };
 
-    try {
-      await fetch("http://127.0.0.1:8081/v1/cookies", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-    } catch {
-      // Ignore if local server is offline.
-    }
-
+    const syncRes = await pushToLocalServer(payload);
     await downloadJson("gemini-auth.json", payload);
 
     const exportedNames = EXPORT_ORDER.filter((name) => info.selected.has(name));
+    const syncLabel = syncRes.ok
+      ? "synced to 127.0.0.1:8081"
+      : syncRes.status
+        ? `rejected (HTTP ${syncRes.status})`
+        : "server offline (saved to file)";
     setStatus(
       `Created gemini-auth.json with ${exportedNames.length} cookie(s) and XSRF.\n\n` +
       `Session cookie: ${info.validation.sessionCookie}\n` +
       `XSRF: present\n` +
       `gemini_bl: ${info.pageMetadata.geminiBl ? "present" : "not present — current server setting will remain"}\n` +
-      `auth_user: ${info.authUser ?? "null"}\n\n` +
+      `auth_user: ${info.authUser ?? "null"}\n` +
+      `Local server sync: ${syncLabel}\n\n` +
       "Move the file into gemini-web2api and do not share it or commit it to Git.",
       "ok"
     );
