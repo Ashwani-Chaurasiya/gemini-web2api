@@ -171,6 +171,11 @@ def _parse_netscape_cookies(raw: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 
+def _core_cookie_sig(cookie_str: str) -> tuple:
+    pairs = dict(p.split("=", 1) for p in (cookie_str or "").split("; ") if "=" in p)
+    return tuple(pairs.get(k, "") for k in ("SID", "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PSIDTS", "__Secure-3PSIDTS", "SAPISID"))
+
+
 def update_cookie_payload(data: dict) -> bool:
     """Update in-memory and on-disk cookie state from a pushed extension payload."""
     if not isinstance(data, dict) or not data.get("cookie"):
@@ -181,7 +186,8 @@ def update_cookie_payload(data: dict) -> bool:
         if not sapisid and cookie_str:
             m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
             sapisid = m.group(1) if m else ""
-        if cookie_str == _cookie_cache.get("str") and not data.get("xsrf_token") and not data.get("gemini_bl"):
+        if _core_cookie_sig(cookie_str) == _core_cookie_sig(_cookie_cache.get("str", "")) and not data.get("xsrf_token") and not data.get("gemini_bl"):
+            _cookie_cache["str"] = cookie_str
             return True
         if data.get("xsrf_token"):
             CONFIG["xsrf_token"] = data["xsrf_token"]
