@@ -41,6 +41,7 @@ try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 __version__ = "1.1.0"
@@ -64,6 +65,7 @@ DEFAULT_CONFIG = {
     "temporary_chats": False,
     "persistent_chat": False,
     "send_model_ticket": True,
+    "reject_on_quota_downgrade": True,
     "model_tickets": {},
 }
 
@@ -389,7 +391,20 @@ def gemini_stream_generate(
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            text = extract_response_text(raw, model_id=model_id)
+            if _is_canned_error(text):
+                raise _CannedError(f"Gemini upstream returned canned error: {text}")
+            return raw
+        except QuotaExceededError:
+            raise
+        except RuntimeError as e:
+            if "BardErrorInfo" in str(e):
+                raise
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except urllib.error.HTTPError as e:
             if e.code in (400, 405) and update_bl_if_needed():
                 reqid = int(time.time()) % 1000000
@@ -484,12 +499,15 @@ def gemini_stream_generate_iter(
 
     if not HAS_HTTPX:
         raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
-        text = extract_response_text(raw)
+        text = extract_response_text(raw, model_id=model_id)
         if text:
             yield text
         return
 
     prev_text = ""
+    yielded_any = False
+    pending = None
+    logged_quota = False
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         try:
@@ -505,6 +523,11 @@ def gemini_stream_generate_iter(
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        if not logged_quota:
+                            quota_msg = extract_quota_downgrade_from_line(line)
+                            if quota_msg:
+                                logged_quota = True
+                                _raise_if_quota_downgraded(quota_msg, model_id)
                         if '"wrb.fr"' not in line or len(line) < 200:
                             continue
                         try:
@@ -518,23 +541,112 @@ def gemini_stream_generate_iter(
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                         for t in part[1]:
                                             if isinstance(t, str) and len(t) > len(prev_text):
+                                                if not yielded_any:
+                                                    if len(t) <= 300:
+                                                        pending = t
+                                                        continue
+                                                    pending = None
                                                 delta = t[len(prev_text):]
                                                 delta = clean_gemini_text(delta, strip=False)
                                                 if delta:
+                                                    yielded_any = True
                                                     yield delta
                                                 prev_text = t
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
+                if pending is not None:
+                    cleaned_pending = clean_gemini_text(pending)
+                    if _is_canned_error(cleaned_pending):
+                        raise _CannedError(f"Gemini upstream returned canned error: {cleaned_pending}")
+                    delta = clean_gemini_text(pending, strip=False)
+                    prev_text = pending
+                    if delta:
+                        yielded_any = True
+                        yield delta
+        except QuotaExceededError:
+            raise
         except Exception as e:
+            if yielded_any:
+                raise
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) in (400, 405):
                 if update_bl_if_needed():
                     log("BL updated, falling back to non-streaming for this request")
                     raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
-                    text = extract_response_text(raw)
+                    text = extract_response_text(raw, model_id=model_id)
                     if text:
                         yield text
                     return
             raise
+
+
+_CANNED_ERROR_RE = re.compile(
+    r"^\W*(?:i'?m having a hard time fulfilling your request"
+    r"|sorry,? something went wrong"
+    r"|something went wrong\.? please try"
+    r"|i seem to be encountering an error"
+    r"|i encountered an error doing what you asked"
+    r"|an error occurred\.? please try"
+    r"|i'?m unable to (?:process|complete) (?:that|this|your) request right now)"
+    r"[^\n]{0,120}$",
+    re.IGNORECASE,
+)
+
+
+class QuotaExceededError(RuntimeError):
+    pass
+
+
+class _CannedError(RuntimeError):
+    pass
+
+
+def _is_canned_error(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().replace("\u2019", "'")
+    if not s or len(s) > 300:
+        return False
+    return bool(_CANNED_ERROR_RE.match(s))
+
+
+def extract_quota_downgrade_from_line(line: str):
+    """Extract quota downgrade message from inner[52] of a wrb.fr frame if present."""
+    if '"wrb.fr"' not in line:
+        return None
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return None
+        inner = json.loads(inner_str)
+        if not (isinstance(inner, list) and len(inner) > 52 and isinstance(inner[52], list) and inner[52]):
+            return None
+        parts = []
+        for entry in inner[52][:2]:
+            if isinstance(entry, list) and entry and isinstance(entry[0], str) and entry[0].strip():
+                parts.append(entry[0].strip())
+            elif isinstance(entry, str) and entry.strip():
+                parts.append(entry.strip())
+        if parts:
+            msg = " ".join(parts)
+            served_hex = inner[39] if len(inner) > 39 and isinstance(inner[39], str) else ""
+            if served_hex == "8c46e95b1a07cecc" or re.search(
+                r"\b(?:limit\s+reached|limit\s+resets|continuing\s+with\s+flash|quota)\b",
+                msg,
+                re.IGNORECASE,
+            ):
+                return msg
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
+    return None
+
+
+def _raise_if_quota_downgraded(quota_msg: str, model_id: int = None) -> None:
+    if not quota_msg or model_id is None or model_id == 6:
+        return
+    log(f"[quota-guard] Upstream downgraded model_id={model_id} due to quota: {quota_msg}")
+    if CONFIG.get("reject_on_quota_downgrade", True):
+        raise QuotaExceededError(quota_msg)
 
 
 def clean_gemini_text(text: str, strip: bool = True) -> str:
@@ -546,14 +658,17 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
-def extract_response_text(raw: str) -> str:
+def extract_response_text(raw: str, model_id: int = None) -> str:
     """Parse StreamGenerate response to extract final text."""
     import re as _re
     bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     texts = []
+    quota_msg = None
     for line in raw.split("\n"):
+        if not quota_msg:
+            quota_msg = extract_quota_downgrade_from_line(line)
         if '"wrb.fr"' not in line or len(line) < 200:
             continue
         try:
@@ -571,6 +686,7 @@ def extract_response_text(raw: str) -> str:
                                     texts.append(t)
         except (json.JSONDecodeError, IndexError, TypeError):
             pass
+    _raise_if_quota_downgraded(quota_msg, model_id)
     text = ""
     for t in reversed(texts):
         if t.strip():
@@ -954,7 +1070,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, extra_fields=None, tool_choice="auto"):
         raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
-        text = extract_response_text(raw)
+        text = extract_response_text(raw, model_id=model_id)
         tool_calls = None
         if tools and text and tool_choice != "none":
             allowed = {
@@ -996,6 +1112,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            try:
+                stream_iter = iter(gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra))
+                first_delta = next(stream_iter, None)
+            except QuotaExceededError as e:
+                self.send_json({"error": {"message": str(e), "type": "quota_exceeded", "code": "model_quota_exceeded"}}, 429)
+                return
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
             # True streaming: forward chunks as they arrive
             try:
                 self.send_response(200)
@@ -1006,7 +1131,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra):
+                if first_delta:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta_text in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -1021,11 +1151,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         # Non-streaming (or tool calling which needs full response)
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra)
+        except QuotaExceededError as e:
+            self.send_json({"error": {"message": str(e), "type": "quota_exceeded", "code": "model_quota_exceeded"}}, 429)
+            return
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1126,6 +1262,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = upload_images(images)
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra)
+        except QuotaExceededError as e:
+            self.send_json({"error": {"message": str(e), "type": "quota_exceeded", "code": "model_quota_exceeded"}}, 429)
+            return
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1234,6 +1373,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = upload_images(images)
             text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs, extra)
+        except QuotaExceededError as e:
+            self.send_json({"error": {"message": str(e), "type": "quota_exceeded", "code": "model_quota_exceeded"}}, 429)
+            return
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

@@ -576,6 +576,13 @@ var MODELS = {
     ticket: '56fdd199312815e2',
     desc: 'Dynamic thinking with adaptive depth',
   },
+  'gemini-3.5-flash-lite': {
+    mode: 6,        // FLASH_LITE - 轻量快速
+    think: 4,       // AUTO
+    variant: 1,
+    ticket: '8c46e95b1a07cecc',
+    desc: 'Lightweight fast model (Gemini 3.5 Flash-Lite)',
+  },
   'gemini-flash-lite': {
     mode: 6,        // FLASH_LITE - 轻量快速
     think: 4,       // AUTO

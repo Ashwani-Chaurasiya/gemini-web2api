@@ -15,6 +15,7 @@ try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 from .config import CONFIG
@@ -461,7 +462,77 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
-def extract_response_text(raw: str) -> str:
+_CANNED_ERROR_RE = re.compile(
+    r"^\W*(?:i'?m having a hard time fulfilling your request"
+    r"|sorry,? something went wrong"
+    r"|something went wrong\.? please try"
+    r"|i seem to be encountering an error"
+    r"|i encountered an error doing what you asked"
+    r"|an error occurred\.? please try"
+    r"|i'?m unable to (?:process|complete) (?:that|this|your) request right now)"
+    r"[^\n]{0,120}$",
+    re.IGNORECASE,
+)
+
+
+class QuotaExceededError(RuntimeError):
+    pass
+
+
+class _CannedError(RuntimeError):
+    pass
+
+
+def _is_canned_error(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().replace("\u2019", "'")
+    if not s or len(s) > 300:
+        return False
+    return bool(_CANNED_ERROR_RE.match(s))
+
+
+def extract_quota_downgrade_from_line(line: str):
+    """Extract quota downgrade message from inner[52] of a wrb.fr frame if present."""
+    if '"wrb.fr"' not in line:
+        return None
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return None
+        inner = json.loads(inner_str)
+        if not (isinstance(inner, list) and len(inner) > 52 and isinstance(inner[52], list) and inner[52]):
+            return None
+        parts = []
+        for entry in inner[52][:2]:
+            if isinstance(entry, list) and entry and isinstance(entry[0], str) and entry[0].strip():
+                parts.append(entry[0].strip())
+            elif isinstance(entry, str) and entry.strip():
+                parts.append(entry.strip())
+        if parts:
+            msg = " ".join(parts)
+            served_hex = inner[39] if len(inner) > 39 and isinstance(inner[39], str) else ""
+            if served_hex == "8c46e95b1a07cecc" or re.search(
+                r"\b(?:limit\s+reached|limit\s+resets|continuing\s+with\s+flash|quota)\b",
+                msg,
+                re.IGNORECASE,
+            ):
+                return msg
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
+    return None
+
+
+def _raise_if_quota_downgraded(quota_msg: str, model_id: int = None) -> None:
+    if not quota_msg or model_id is None or model_id == 6:
+        return
+    log(f"[quota-guard] Upstream downgraded model_id={model_id} due to quota: {quota_msg}")
+    if CONFIG.get("reject_on_quota_downgrade", True):
+        raise QuotaExceededError(quota_msg)
+
+
+def extract_response_text(raw: str, model_id: int = None) -> str:
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
@@ -470,7 +541,10 @@ def extract_response_text(raw: str) -> str:
         log(f"[model-verify] Served model: {label or 'unknown'} [{hex_id or 'no-hex'}]")
     last_text = ""
     conv_id = resp_id = rcid = ""
+    quota_msg = None
     for line in raw.split("\n"):
+        if not quota_msg:
+            quota_msg = extract_quota_downgrade_from_line(line)
         c, r, rc = extract_conv_ids_from_line(line)
         if c:
             conv_id = c
@@ -482,6 +556,7 @@ def extract_response_text(raw: str) -> str:
             cleaned = clean_text(t)
             if cleaned:
                 last_text = cleaned
+    _raise_if_quota_downgraded(quota_msg, model_id)
     set_last_conv_ids((conv_id, resp_id, rcid))
     return last_text
 
@@ -510,7 +585,20 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw, model_id=model_id)
+            if _is_canned_error(text):
+                raise _CannedError(f"Gemini upstream returned canned error: {text}")
+            return text
+        except QuotaExceededError:
+            raise
+        except _CannedError as e:
+            if extra_fields and 2 in extra_fields:
+                raise
+            last_err = e
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts} after canned error: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (400, 405) and not refreshed and refresh_bl_and_xsrf():
@@ -543,15 +631,18 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    yielded_any = False
     attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
     attempt = 0
     while attempt < attempts:
         body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
         url = _get_url()
         headers = _build_headers(extra_fields)
+        pending = None
+        logged_quota = False
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
-                if resp.status_code in (400, 405) and not refreshed and not emitted_raw_text:
+                if resp.status_code in (400, 405) and not refreshed and not yielded_any:
                     refreshed = True
                     if refresh_bl_and_xsrf():
                         log(f"Stream HTTP {resp.status_code}: refreshed BL/XSRF, retrying immediately...")
@@ -568,6 +659,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        if not logged_quota:
+                            quota_msg = extract_quota_downgrade_from_line(line)
+                            if quota_msg:
+                                logged_quota = True
+                                _raise_if_quota_downgraded(quota_msg, model_id)
                         c, r, rc = extract_conv_ids_from_line(line)
                         if c or r or rc:
                             prev_c, prev_r, prev_rc = get_last_conv_ids()
@@ -577,14 +673,39 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 continue
                             if not t.startswith(emitted_raw_text):
                                 raise RuntimeError("Gemini stream content changed during retry")
+                            if not yielded_any:
+                                if len(t) <= 300:
+                                    pending = t
+                                    continue
+                                pending = None
                             delta = clean_text(t[len(emitted_raw_text):], strip=False)
                             emitted_raw_text = t
                             if delta:
+                                yielded_any = True
                                 yield delta
+                if pending is not None:
+                    cleaned_pending = clean_text(pending)
+                    if _is_canned_error(cleaned_pending):
+                        raise _CannedError(f"Gemini upstream returned canned error: {cleaned_pending}")
+                    delta = clean_text(pending, strip=False)
+                    emitted_raw_text = pending
+                    if delta:
+                        yielded_any = True
+                        yield delta
             return
+        except QuotaExceededError:
+            raise
+        except _CannedError as e:
+            if extra_fields and 2 in extra_fields:
+                raise
+            last_err = e
+            attempt += 1
+            if attempt < attempts:
+                log(f"Stream retry {attempt}/{attempts} after canned error: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
-            if emitted_raw_text:
+            if yielded_any:
                 raise
             attempt += 1
             if attempt < attempts:

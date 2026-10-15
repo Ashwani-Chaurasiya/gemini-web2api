@@ -621,6 +621,189 @@ class ArgonAndModelRoutingTests(unittest.TestCase):
         self.assertEqual(calls2, [])
         self.assertEqual(clean2, prose)
 
+    def test_quota_downgrade_raises_429_for_argon_and_allows_flash_lite(self):
+        import urllib.request
+        import urllib.error
+        from gemini_web2api.gemini import (
+            QuotaExceededError,
+            _chat_window,
+            generate,
+            generate_stream,
+        )
+        from gemini_web2api.server import GeminiHandler, ThreadedServer
+
+        def make_quota_frame(msg: str) -> bytes:
+            inner = [None] * 55
+            inner[4] = [["rc_1", [msg]]]
+            inner[39] = "8c46e95b1a07cecc"
+            inner[42] = "3.5 Flash-Lite"
+            inner[52] = [
+                ["Limit reached. Continuing with Flash-Lite."],
+                ["Some features aren’t available until your limit resets on Oct 15 at 3:40 PM."],
+            ]
+            line = json.dumps([["wrb.fr", None, json.dumps(inner) + (" " * 120)]]) + "\n"
+            return line.encode("utf-8")
+
+        class FakeResp:
+            def __init__(self, payload: bytes):
+                self._payload = payload
+
+            def read(self):
+                return self._payload
+
+        calls = []
+
+        def fake_urlopen(req, context=None, timeout=None):
+            calls.append(req.full_url)
+            return FakeResp(make_quota_frame("downgraded reply"))
+
+        # Requesting Argon (model_id=8) fails fast on attempt 1 with QuotaExceededError
+        with mock.patch.dict(CONFIG, {"retry_attempts": 3, "reject_on_quota_downgrade": True}), \
+             mock.patch("gemini_web2api.gemini.urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(QuotaExceededError) as ctx:
+                generate("hello", 8, 2)
+            self.assertIn("Limit reached. Continuing with Flash-Lite.", str(ctx.exception))
+            self.assertIn("Oct 15 at 3:40 PM", str(ctx.exception))
+            self.assertEqual(len(calls), 1)
+
+            # Requesting Flash-Lite (model_id=6) succeeds with 200 OK
+            out_lite = generate("hello", 6, 4)
+            self.assertEqual(out_lite, "downgraded reply")
+
+            # Unrelated inner[52] banner without quota/Flash-Lite downgrade does NOT trigger 429
+            inner_other = [None] * 55
+            inner_other[4] = [["rc_1", ["normal argon reply"]]]
+            inner_other[39] = "95a4c0abcba24364"
+            inner_other[42] = "4 Argon Medium"
+            inner_other[52] = [["Welcome to Gemini Extensions"]]
+            other_frame = (json.dumps([["wrb.fr", None, json.dumps(inner_other) + (" " * 120)]]) + "\n").encode("utf-8")
+            with mock.patch("gemini_web2api.gemini.urllib.request.urlopen", return_value=FakeResp(other_frame)):
+                self.assertEqual(generate("hello", 8, 2), "normal argon reply")
+
+        # HTTP server returns 429 JSON for both non-streaming and real generate_stream (even with >300 char text)
+        class FakeStreamResp:
+            status_code = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_text(self):
+                yield make_quota_frame("A" * 400).decode("utf-8")
+
+        class FakeStreamClient:
+            def stream(self, method, url, content=None, headers=None):
+                return FakeStreamResp()
+
+        import http.client
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        import threading
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = server.server_address[1]
+            with mock.patch("gemini_web2api.gemini.urllib.request.urlopen", side_effect=fake_urlopen), \
+                 mock.patch("gemini_web2api.gemini.HAS_HTTPX", True), \
+                 mock.patch("gemini_web2api.gemini._get_httpx_client", return_value=FakeStreamClient()):
+                for stream_flag in (False, True):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        conn.request(
+                            "POST",
+                            "/v1/chat/completions",
+                            body=json.dumps({
+                                "model": "gemini-4-argon",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": stream_flag,
+                            }).encode(),
+                            headers={"Content-Type": "application/json"},
+                        )
+                        resp = conn.getresponse()
+                        err_body = json.loads(resp.read().decode())
+                        self.assertEqual(resp.status, 429)
+                        self.assertEqual(err_body["error"]["code"], "model_quota_exceeded")
+                        self.assertIn("Limit reached", err_body["error"]["message"])
+                    finally:
+                        conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            _chat_window.reset()
+
+    def test_persistent_chat_canned_error_resets_window_and_retries_full_prompt(self):
+        import urllib.request
+        from gemini_web2api.gemini import _CannedError, _chat_window, set_last_conv_ids
+        from gemini_web2api.server import GeminiHandler, ThreadedServer
+
+        CONFIG["persistent_chat"] = True
+        _chat_window.reset()
+        seen_calls = []
+
+        def fake_generate(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
+            seen_calls.append((prompt, dict(extra_fields or {})))
+            if len(seen_calls) == 1:
+                set_last_conv_ids(("c_123", "r_456", "rc_789"))
+                return "turn1 reply"
+            if len(seen_calls) == 2:
+                # Continuation fails with canned error
+                raise _CannedError("Gemini upstream returned canned error: I encountered an error doing what you asked.")
+            set_last_conv_ids(("c_999", "r_999", "rc_999"))
+            return "recovered full-prompt reply"
+
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        import threading
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = server.server_address[1]
+            with mock.patch("gemini_web2api.server.generate", side_effect=fake_generate):
+                msgs1 = [{"role": "system", "content": "sys-prompt"}, {"role": "user", "content": "turn1-user"}]
+                req1 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps({"model": "gemini-4-argon", "messages": msgs1}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req1, timeout=5) as r1:
+                    resp1 = json.loads(r1.read().decode())
+                    self.assertEqual(r1.status, 200)
+
+                msgs2 = msgs1 + [
+                    resp1["choices"][0]["message"],
+                    {"role": "user", "content": "turn2-user"},
+                ]
+                req2 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps({"model": "gemini-4-argon", "messages": msgs2}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req2, timeout=5) as r2:
+                    resp2 = json.loads(r2.read().decode())
+                    self.assertEqual(r2.status, 200)
+                    self.assertEqual(resp2["choices"][0]["message"]["content"], "recovered full-prompt reply")
+
+            self.assertEqual(len(seen_calls), 3)
+            # Call 2 was delta-only continuation with conv_meta in extra[2]
+            self.assertEqual(seen_calls[1][0], "turn2-user")
+            self.assertIn(2, seen_calls[1][1])
+            # Call 3 was full-prompt retry without extra[2] and with _ticket intact
+            self.assertIn("sys-prompt", seen_calls[2][0])
+            self.assertIn("turn1-user", seen_calls[2][0])
+            self.assertIn("turn2-user", seen_calls[2][0])
+            self.assertNotIn(2, seen_calls[2][1])
+            self.assertIn("_ticket", seen_calls[2][1])
+            self.assertEqual(_chat_window.conv_id, "c_999")
+        finally:
+            server.shutdown()
+            server.server_close()
+            _chat_window.reset()
+
 
 if __name__ == "__main__":
     unittest.main()

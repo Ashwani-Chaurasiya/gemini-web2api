@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "temporary_chats": False,
     "persistent_chat": False,
     "send_model_ticket": True,
+    "reject_on_quota_downgrade": True,
     "model_tickets": {},
 }
 
