@@ -38,6 +38,7 @@ MODELS = {
     "gemini-3.1-pro-enhanced": {"mode": 3, "think": 4, "variant": 3, "ticket": "e6fa609c3fa255c0", "extra": {31: 2, 80: 3}, "desc": "Pro with enhanced output (experimental)"},
     "gemini-auto": {"mode": 4, "think": 4, "variant": 1, "ticket": "56fdd199312815e2", "desc": "Auto model selection"},
     "gemini-3.5-flash-thinking-lite": {"mode": 5, "think": 0, "variant": 1, "ticket": "56fdd199312815e2", "desc": "Dynamic thinking with adaptive depth"},
+    "gemini-3.5-flash-lite": {"mode": 6, "think": 4, "variant": 1, "ticket": "8c46e95b1a07cecc", "desc": "Lightweight fast model (Gemini 3.5 Flash-Lite)"},
     "gemini-flash-lite": {"mode": 6, "think": 4, "variant": 1, "ticket": "8c46e95b1a07cecc", "desc": "Lightweight fast model"},
 }
 
