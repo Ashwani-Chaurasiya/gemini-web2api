@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -127,6 +128,23 @@ def _extract_sapisid(cookie_str: str) -> str:
     return m.group(1) if m else ""
 
 
+def _normalize_model_tickets(raw_tickets) -> dict:
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if len(clean) >= 32:
+            break
+        if (
+            isinstance(mk, str)
+            and isinstance(mv, str)
+            and re.fullmatch(r"gemini-[a-z0-9._-]{1,48}", mk.strip())
+            and re.fullmatch(r"[0-9a-fA-F]{16}", mv.strip())
+        ):
+            clean[mk.strip()] = mv.strip().lower()
+    return clean
+
+
 def _normalize_metadata(data: dict) -> dict:
     meta = {}
     for k in ("xsrf_token", "gemini_bl"):
@@ -136,6 +154,9 @@ def _normalize_metadata(data: dict) -> dict:
     au = data.get("auth_user")
     if isinstance(au, (int, str)) and not isinstance(au, bool) and str(au).strip().isdigit():
         meta["auth_user"] = str(au).strip()
+    tickets = _normalize_model_tickets(data.get("model_tickets"))
+    if tickets:
+        meta["model_tickets"] = tickets
     return meta
 
 
@@ -154,11 +175,16 @@ def update_cookie_payload(data: dict) -> tuple:
 
     with _cookie_lock:
         same_cookie = cookie_str == _cookie_cache.get("str") and (sapisid or None) == _cookie_cache.get("sapisid")
-        has_new_meta = any(meta.get(k) != CONFIG.get(k) for k in meta)
-        for k, v in meta.items():
-            CONFIG[k] = v
+        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+        new_tickets = meta.get("model_tickets") or {}
+        tickets_changed = any(cur_tickets.get(k) != v for k, v in new_tickets.items())
+        scalar_changed = any(meta.get(k) != CONFIG.get(k) for k in meta if k != "model_tickets")
+        has_new_meta = scalar_changed or tickets_changed
         if same_cookie and not has_new_meta:
             return True, "", 200
+
+        merged_tickets = dict(cur_tickets)
+        merged_tickets.update(new_tickets)
 
         cf = CONFIG.get("cookie_file")
         mtime = _cookie_cache["mtime"]
@@ -176,7 +202,16 @@ def update_cookie_payload(data: dict) -> tuple:
                 existing["cookie"] = cookie_str
                 if sapisid:
                     existing["sapisid"] = sapisid
-                existing.update(meta)
+                disk_tickets = _normalize_model_tickets(existing.get("model_tickets"))
+                if disk_tickets or merged_tickets:
+                    combined = dict(cur_tickets)
+                    combined.update(disk_tickets)
+                    combined.update(new_tickets)
+                    merged_tickets = _normalize_model_tickets(combined)
+                    existing["model_tickets"] = merged_tickets
+                for k, v in meta.items():
+                    if k != "model_tickets":
+                        existing[k] = v
                 parent_dir = os.path.dirname(os.path.abspath(cf)) or "."
                 fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".cookie-", suffix=".tmp")
                 with os.fdopen(fd, "w", encoding="utf-8") as wf:
@@ -193,6 +228,11 @@ def update_cookie_payload(data: dict) -> tuple:
                 log(f"Cookie persist error: {e}")
                 return False, "failed to persist cookie file", 500
 
+        for k, v in meta.items():
+            if k != "model_tickets":
+                CONFIG[k] = v
+        if merged_tickets:
+            CONFIG["model_tickets"] = merged_tickets
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         log("Updated cookies via /v1/cookies")
         return True, "", 200
@@ -214,6 +254,11 @@ def load_cookie() -> tuple:
                 data = json.loads(content)
                 cookie_str = data.get("cookie", "")
                 sapisid = data.get("sapisid", "") or _extract_sapisid(cookie_str)
+                meta = _normalize_metadata(data)
+                if "model_tickets" in meta:
+                    cur_tickets = dict(CONFIG.get("model_tickets") or {})
+                    cur_tickets.update(meta["model_tickets"])
+                    CONFIG["model_tickets"] = cur_tickets
             else:
                 cookie_str = content
                 sapisid = _extract_sapisid(cookie_str)

@@ -8,7 +8,9 @@
     "downloads",
     "tabs",
     "scripting",
-    "alarms"
+    "alarms",
+    "storage",
+    "webRequest"
   ],
   "host_permissions": [
     "https://google.com/*",

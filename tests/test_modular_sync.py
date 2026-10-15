@@ -457,6 +457,7 @@ class StreamingEndpointTests(unittest.TestCase):
                     "xsrf_token": "xsrf_keep",
                     "gemini_bl": "boq_keep_p0",
                     "auth_user": "2",
+                    "model_tickets": {"gemini-3.1-pro": "e6fa609c3fa255c0"},
                 },
                 tf,
             )
@@ -514,6 +515,38 @@ class StreamingEndpointTests(unittest.TestCase):
                 self.assertEqual(saved["xsrf_token"], "xsrf_keep")
                 self.assertEqual(saved["gemini_bl"], "boq_keep_p0")
                 self.assertEqual(saved["auth_user"], "1")
+                self.assertEqual(saved["model_tickets"], {"gemini-3.1-pro": "e6fa609c3fa255c0"})
+
+                # Ticket-only update with unchanged cookies merges additively and filters invalid entries
+                status2, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {
+                        "cookie": "SID=new_sid; __Secure-1PSIDTS=ts_new; SAPISID=sapi_new",
+                        "model_tickets": {
+                            "gemini-4-argon": "95A4C0ABCBA24364",
+                            "bad key!": "95a4c0abcba24364",
+                            "gemini-auto": "not-16-hex",
+                        },
+                    },
+                    headers=sync_headers,
+                )
+                self.assertEqual(status2, 200)
+                self.assertEqual(
+                    CONFIG["model_tickets"],
+                    {
+                        "gemini-3.1-pro": "e6fa609c3fa255c0",
+                        "gemini-4-argon": "95a4c0abcba24364",
+                    },
+                )
+                with open(temp_path, "r", encoding="utf-8") as rf2:
+                    saved2 = json.load(rf2)
+                self.assertEqual(
+                    saved2["model_tickets"],
+                    {
+                        "gemini-3.1-pro": "e6fa609c3fa255c0",
+                        "gemini-4-argon": "95a4c0abcba24364",
+                    },
+                )
 
                 # CR/LF injection -> 400
                 crlf_status, _, _ = self.post_json(
@@ -523,16 +556,29 @@ class StreamingEndpointTests(unittest.TestCase):
                 )
                 self.assertEqual(crlf_status, 400)
 
-                # Standalone single-file parity check
+                # Standalone single-file parity check including model_tickets
                 import importlib.util
                 from pathlib import Path
                 sf_path = Path(__file__).resolve().parents[1] / "gemini_web2api.py"
                 spec = importlib.util.spec_from_file_location("gemini_web2api_single", sf_path)
                 single_file = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(single_file)
-                ok, err_msg, code = single_file.update_cookie_payload({"cookie": "SID=sf; SAPISID=sf_sapi"})
+                single_file.CONFIG["cookie_file"] = temp_path
+                ok, err_msg, code = single_file.update_cookie_payload({
+                    "cookie": "SID=sf; SAPISID=sf_sapi",
+                    "model_tickets": {"gemini-flash-lite": "8c46e95b1a07cecc"},
+                })
                 self.assertTrue(ok)
                 self.assertEqual(code, 200)
+                self.assertEqual(single_file.CONFIG["model_tickets"]["gemini-flash-lite"], "8c46e95b1a07cecc")
+                self.assertEqual(single_file.CONFIG["model_tickets"]["gemini-4-argon"], "95a4c0abcba24364")
+
+                # Fresh load_cookie reads model_tickets from disk
+                _cookie_cache.update({"str": "", "sapisid": None, "mtime": 0})
+                CONFIG["model_tickets"] = {}
+                load_cookie()
+                self.assertEqual(CONFIG["model_tickets"]["gemini-flash-lite"], "8c46e95b1a07cecc")
+                self.assertEqual(CONFIG["model_tickets"]["gemini-4-argon"], "95a4c0abcba24364")
         finally:
             _cookie_cache.update({"str": "", "sapisid": None, "mtime": 0})
             if os.path.exists(temp_path):
